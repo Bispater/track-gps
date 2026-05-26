@@ -1,0 +1,34 @@
+services:
+  app:
+    build: .
+    container_name: track-service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PORT=3000
+    volumes:
+      # Logs y schedules persistidos fuera del contenedor — sobreviven a redeploys
+      - ./logs:/app/logs
+    expose:
+      - "3000"
+    # Para correr SIN Caddy (acceso directo en puerto 3000): descomenta esta línea
+    # ports:
+    #   - "3000:3000"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: track-service-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:
