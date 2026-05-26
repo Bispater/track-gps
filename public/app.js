@@ -1401,25 +1401,53 @@ function renderFalabellaGroup(g, allVehicles, cfg) {
     toast(`Aceptados ${accepted} · sin tracking ${noTracking} · fallidos ${failed}`, failed ? 'err' : 'ok');
   } }, 'Enviar grupo');
 
-  // Badge de estado del scheduler
-  const schedBadge = g.enabled
-    ? el('span', { class: 'badge ok' }, `auto · cada ${g.intervalSec || 20}s`)
-    : el('span', { class: 'badge muted' }, 'auto pausado');
+  // Badge de estado en el header (se actualiza reactivamente)
+  const schedBadge = el('span', { class: 'badge' });
+  function refreshSchedBadge() {
+    if (enabledToggle.checked) {
+      schedBadge.className = 'badge ok';
+      schedBadge.textContent = `auto · cada ${Number(intervalInput.value) || 20}s`;
+    } else {
+      schedBadge.className = 'badge muted';
+      schedBadge.textContent = 'auto pausado';
+    }
+  }
+  refreshSchedBadge();
+  enabledToggle.addEventListener('change', refreshSchedBadge);
+  intervalInput.addEventListener('input', refreshSchedBadge);
+
   const lastInfo = g.lastRunAt
     ? el('small', { style: 'color: var(--text-dim);' },
         `último: ${fmtDate(g.lastRunAt)} · ${g.lastSummary?.accepted ?? 0}/${g.lastSummary?.total ?? 0} aceptados`)
     : el('small', { style: 'color: var(--text-dim);' }, 'sin envíos automáticos aún');
 
+  // Switch grande de Auto-envío con estado reactivo
+  const statusLabel = el('span', { class: 'label-status' });
+  function refreshStatusLabel() {
+    statusLabel.textContent = enabledToggle.checked ? 'Enviando automáticamente' : 'Pausado';
+    statusLabel.style.color = enabledToggle.checked ? 'var(--ok)' : 'var(--text-dim)';
+  }
+  refreshStatusLabel();
+  enabledToggle.addEventListener('change', refreshStatusLabel);
+
+  const switchEl = el('label', { class: 'toggle-switch' },
+    enabledToggle,
+    el('span', { class: 'track' }),
+    el('span', { class: 'knob' }),
+  );
+
+  const toggleRow = el('div', { class: 'toggle-row' },
+    el('span', { class: 'label-main' }, 'Auto-envío'),
+    switchEl,
+    statusLabel,
+  );
+
   // Body inicialmente colapsado
   const body = el('div', { class: 'card-body', style: 'display: none;' },
+    toggleRow,
     el('div', { class: 'row', style: 'margin-bottom: 10px;' },
       field('Entorno', envSel),
       field('Intervalo (seg)', intervalInput),
-      el('div', { class: 'field' },
-        el('label', {}, 'Auto-envío'),
-        el('label', { style: 'display:flex; gap:6px; align-items:center; padding: 7px 0;' },
-          enabledToggle, enabledToggle.checked ? 'enviando' : 'pausado'),
-      ),
     ),
     lastInfo,
     chipsBox,
@@ -1573,9 +1601,25 @@ views.envios = async () => {
   if (enviosTimer) clearInterval(enviosTimer);
   enviosTimer = setInterval(() => {
     if (currentView() !== 'envios') { clearInterval(enviosTimer); enviosTimer = null; return; }
+    // Pausa el refresh si hay alguna fila de detalle abierta (para no perder la vista del usuario)
+    if (countOpenEnviosDetails() > 0) { updateEnviosRefreshHint(true); return; }
+    updateEnviosRefreshHint(false);
     refreshEnvios();
   }, 5000);
 };
+
+function countOpenEnviosDetails() {
+  return Array.from(document.querySelectorAll('#view tr.detail-row'))
+    .filter(r => r.style.display !== 'none').length;
+}
+function updateEnviosRefreshHint(paused) {
+  const hint = document.getElementById('enviosRefreshHint');
+  if (!hint) return;
+  hint.textContent = paused
+    ? '⏸ auto-refresh pausado · cierra los detalles para reanudar'
+    : 'auto-refresca cada 5s · click en una fila para ver detalle';
+  hint.style.color = paused ? 'var(--warn)' : 'var(--text-dim)';
+}
 
 function buildEnviosView() {
   const view = $('#view');
@@ -1621,7 +1665,8 @@ function buildEnviosView() {
       el('button', { class: 'ghost', onclick: refreshEnvios }, '↻ Refrescar'),
     ),
     el('div', { class: 'toolbar' }, search, serviceFilter, resultFilter,
-      el('small', { style: 'color: var(--text-dim); margin-left: 8px;' }, 'auto-refresca cada 5s · click en una fila para ver detalle'),
+      el('small', { id: 'enviosRefreshHint', style: 'color: var(--text-dim); margin-left: 8px;' },
+        'auto-refresca cada 5s · click en una fila para ver detalle'),
     ),
     el('div', { class: 'card-body tight' }, tbl),
   ));
@@ -1747,6 +1792,7 @@ function renderEnviosRows() {
       const showing = detailRow.style.display !== 'none';
       detailRow.style.display = showing ? 'none' : '';
       row.classList.toggle('selected', !showing);
+      updateEnviosRefreshHint(countOpenEnviosDetails() > 0);
     };
     row.addEventListener('click', (ev) => { if (ev.target !== eyeBtn) toggle(); });
     eyeBtn.addEventListener('click', (ev) => { ev.stopPropagation(); toggle(); });

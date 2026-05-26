@@ -25,7 +25,17 @@ const {
   FALABELLA_USER_AGENT = 'gps/1.0.0',
   FALABELLA_PROVIDER_DNI = '',
   FALABELLA_PROVIDER_NAME = '',
+  ALLOWED_GROUPS = '',
 } = process.env;
+
+// Lista blanca de grupos fm-track (nombres o ids). Vacío = todos.
+const ALLOWED_GROUPS_SET = new Set(
+  ALLOWED_GROUPS.split(',').map((s) => s.trim()).filter(Boolean)
+);
+function isGroupAllowed(g) {
+  if (ALLOWED_GROUPS_SET.size === 0) return true;
+  return ALLOWED_GROUPS_SET.has(g.name) || ALLOWED_GROUPS_SET.has(g.id);
+}
 
 // Limpia llaves/espacios que muchas veces se pegan con el placeholder de la doc
 const FM_TRACK_API_KEY = (process.env.FM_TRACK_API_KEY || '').trim().replace(/^[{<\[]+|[}>\]]+$/g, '');
@@ -635,7 +645,7 @@ app.get('/api/fm-track/groups', async (_req, res) => {
       id: String(g.id),
       name: String(g.name || ''),
       vehicles: Array.isArray(g.objects_ids) ? g.objects_ids.map(String) : [],
-    }));
+    })).filter(isGroupAllowed);
     res.json({ groups });
   } catch (err) { res.status(502).json({ error: String(err) }); }
 });
@@ -652,12 +662,13 @@ app.get('/api/falabella/config', (_req, res) => {
   });
 });
 
-// Devuelve los grupos de fm-track mezclados con la config local de envío.
+// Devuelve los grupos de fm-track (filtrados por ALLOWED_GROUPS) mezclados con la config local de envío.
 app.get('/api/falabella/groups', async (_req, res) => {
   try {
     await ensureGroupsCache();
     const groups = {};
     for (const g of groupsCache.groups) {
+      if (!isGroupAllowed(g)) continue;
       groups[g.id] = {
         id: g.id,
         name: g.name,
@@ -738,6 +749,7 @@ setInterval(async () => {
   try { await ensureGroupsCache(); } catch { return; }
   const now = Date.now();
   for (const fmGroup of groupsCache.groups) {
+    if (!isGroupAllowed(fmGroup)) continue; // respeta la whitelist
     const config = falabellaGroups[fmGroup.id];
     if (!config?.enabled) continue;
     if (!fmGroup.vehicles?.length) continue;
