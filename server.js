@@ -25,17 +25,29 @@ const {
   FALABELLA_USER_AGENT = 'gps/1.0.0',
   FALABELLA_PROVIDER_DNI = '',
   FALABELLA_PROVIDER_NAME = '',
+  FALABELLA_TIMEZONE = 'America/Santiago',
   ALLOWED_GROUPS = '',
+  FALABELLA_GROUPS = '',
+  WISE_API_URL = 'https://gw2.wisetrack.cl/Sotraser/1.0/InsertarPosicion',
+  WISE_API_TOKEN = '',
+  WISE_GROUPS = '',
+  WISE_TIMEZONE = 'America/Santiago',
 } = process.env;
 
-// Lista blanca de grupos fm-track (nombres o ids). Vacío = todos.
-const ALLOWED_GROUPS_SET = new Set(
-  ALLOWED_GROUPS.split(',').map((s) => s.trim()).filter(Boolean)
-);
-function isGroupAllowed(g) {
-  if (ALLOWED_GROUPS_SET.size === 0) return true;
-  return ALLOWED_GROUPS_SET.has(g.name) || ALLOWED_GROUPS_SET.has(g.id);
+function makeGroupSet(raw) {
+  return new Set((raw || '').split(',').map((s) => s.trim()).filter(Boolean));
 }
+const ALLOWED_GROUPS_SET = makeGroupSet(ALLOWED_GROUPS);
+const FALABELLA_GROUPS_SET = makeGroupSet(FALABELLA_GROUPS || ALLOWED_GROUPS);
+const WISE_GROUPS_SET = makeGroupSet(WISE_GROUPS);
+
+function isInSet(g, set) {
+  if (set.size === 0) return true;
+  return set.has(g.name) || set.has(g.id);
+}
+const isGroupAllowed = (g) => isInSet(g, ALLOWED_GROUPS_SET);
+const isFalabellaGroupAllowed = (g) => isInSet(g, FALABELLA_GROUPS_SET);
+const isWiseGroupAllowed = (g) => isInSet(g, WISE_GROUPS_SET);
 
 // Limpia llaves/espacios que muchas veces se pegan con el placeholder de la doc
 const FM_TRACK_API_KEY = (process.env.FM_TRACK_API_KEY || '').trim().replace(/^[{<\[]+|[}>\]]+$/g, '');
@@ -46,6 +58,9 @@ const HISTORY_FILE = path.join(LOG_DIR, 'forward-history.jsonl');
 const SCHEDULES_FILE = path.join(LOG_DIR, 'schedules.json');
 const FALABELLA_GROUPS_FILE = path.join(LOG_DIR, 'falabella-groups.json');
 const FALABELLA_HISTORY_FILE = path.join(LOG_DIR, 'falabella-history.jsonl');
+const WISE_GROUPS_FILE = path.join(LOG_DIR, 'wise-groups.json');
+const WISE_HISTORY_FILE = path.join(LOG_DIR, 'wise-history.jsonl');
+const WISE_BLOCKED_FILE = path.join(LOG_DIR, 'wise-blocked.json');
 await fs.mkdir(LOG_DIR, { recursive: true });
 
 async function appendJsonl(file, entry) {
@@ -87,6 +102,7 @@ async function pruneAllHistories() {
     pruneJsonlFile(LOG_FILE),
     pruneJsonlFile(HISTORY_FILE),
     pruneJsonlFile(FALABELLA_HISTORY_FILE),
+    pruneJsonlFile(WISE_HISTORY_FILE),
   ]);
   const totalRemoved = results.reduce((s, r) => s + (r.removed || 0), 0);
   if (totalRemoved > 0) {
@@ -221,6 +237,29 @@ function toIsoUtc(ts) {
   if (!ts) return new Date().toISOString();
   const d = new Date(ts);
   return isNaN(d) ? new Date().toISOString() : d.toISOString();
+}
+
+// Convierte un timestamp a ISO 8601 con offset local explícito (ej: 2026-05-26T14:21:41-04:00).
+// Mantiene el mismo "instante" en el tiempo — solo cambia la representación.
+function toIsoLocal(ts, tz) {
+  const d = new Date(ts || Date.now());
+  if (isNaN(d.getTime())) return new Date().toISOString();
+  const dtf = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(d)) parts[p.type] = p.value;
+  const hh = parts.hour === '24' ? '00' : parts.hour;
+  // Calcular offset en minutos: comparar el "wall clock" en tz contra UTC del mismo instante.
+  const asUtcMs = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +hh, +parts.minute, +parts.second);
+  const offsetMin = Math.round((asUtcMs - d.getTime()) / 60000);
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const absMin = Math.abs(offsetMin);
+  const oHh = String(Math.floor(absMin / 60)).padStart(2, '0');
+  const oMm = String(absMin % 60).padStart(2, '0');
+  return `${parts.year}-${parts.month}-${parts.day}T${hh}:${parts.minute}:${parts.second}${sign}${oHh}:${oMm}`;
 }
 
 function buildQAPayload(obj, pos, schedule) {
@@ -539,7 +578,8 @@ function buildFalabellaPayload(obj, pos, providerOverride) {
   const referenceId = String(pick(obj, ['id', 'object_id']) || pick(pos, ['object_id']) || vehicleId);
   const lat = round(pick(pos, ['position.latitude']), 6, 0);
   const lng = round(pick(pos, ['position.longitude']), 6, 0);
-  const ts = pick(pos, ['datetime']) || new Date().toISOString();
+  // Falabella pide ISO 8601 con zona horaria. Enviamos en hora local con offset (mismo instante).
+  const ts = toIsoLocal(pick(pos, ['datetime']), FALABELLA_TIMEZONE);
   const speedKmh = Number(pick(pos, ['position.speed']) ?? 0);
   const heading = Number(pick(pos, ['position.direction']) ?? 0);
   const ignited = pick(pos, ['ignition_status']) === 'ON';
@@ -616,7 +656,7 @@ async function sendForVehicles({ groupId, vehicleIds, env, x_country, providerOv
         x_country: x_country || config?.x_country,
         txref,
       });
-      const entry = { vehicleId: vid, ...r, payload, groupId };
+      const entry = { vehicleId: vid, ...r, payload, raw: pos, groupId };
       await appendFalabellaHistory(entry);
       results.push(entry);
     } catch (err) {
@@ -662,7 +702,7 @@ app.get('/api/falabella/groups', async (_req, res) => {
     await ensureGroupsCache();
     const groups = {};
     for (const g of groupsCache.groups) {
-      if (!isGroupAllowed(g)) continue;
+      if (!isFalabellaGroupAllowed(g)) continue;
       groups[g.id] = {
         id: g.id,
         name: g.name,
@@ -737,13 +777,364 @@ app.get('/api/falabella/history', async (req, res) => {
   res.json({ entries });
 });
 
+// ===================== Wise (Wisetrack) =====================
+const appendWiseHistory = (e) => appendJsonl(WISE_HISTORY_FILE, e);
+
+let wiseGroups = {};
+function defaultWiseGroupConfig() {
+  // Wise exige >=20s entre llamadas; recomienda 30-60s para evento online (45). Default 30s.
+  return { intervalSec: 30, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
+}
+async function loadWiseGroups() {
+  try { wiseGroups = JSON.parse(await fs.readFile(WISE_GROUPS_FILE, 'utf8')); }
+  catch { wiseGroups = {}; }
+}
+async function saveWiseGroups() {
+  await fs.writeFile(WISE_GROUPS_FILE, JSON.stringify(wiseGroups, null, 2), 'utf8');
+}
+await loadWiseGroups();
+
+// Adapter Wise: lat/lng como string con coma decimal, fecha "yyyy-MM-dd HH:mm:ss" en UTC.
+function toWiseCoord(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '';
+  return Number(n).toFixed(6).replace('.', ',');
+}
+function toWiseDatetime(ts) {
+  const d = new Date(ts || Date.now());
+  if (isNaN(d.getTime())) return '';
+  // Wisetrack en Chile: enviar la hora en la zona horaria local (configurable via WISE_TIMEZONE).
+  // Formato: yyyy-MM-dd HH:mm:ss (sin marcador de zona, como pide la doc).
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: WISE_TIMEZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t)?.value || '00';
+  // Algunos locales devuelven "24" para medianoche; normalizar a "00".
+  const hh = get('hour') === '24' ? '00' : get('hour');
+  return `${get('year')}-${get('month')}-${get('day')} ${hh}:${get('minute')}:${get('second')}`;
+}
+// Evento según tabla Wise:
+//   45 = posición online con ignición + conectado a la red
+//   46 = posición con motor apagado
+function inferWiseEvent(pos) {
+  const ign = pick(pos, ['ignition_status']);
+  return ign === 'ON' ? '45' : '46';
+}
+// Construye una posición individual (item dentro del array `posicion`)
+function buildWisePosicionItem(obj, pos) {
+  const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
+  const patente = String(plateRaw || pick(obj, ['id']) || '').replace(/[^A-Za-z0-9-]/g, '').toUpperCase();
+  const lat = pick(pos, ['position.latitude']);
+  const lng = pick(pos, ['position.longitude']);
+  const direccion = clampInt(pick(pos, ['position.direction']), 0, 359, 0);
+  const velocidad = clampInt(pick(pos, ['position.speed']), 0, 999, 0);
+  return {
+    patente,
+    fecha_hora: toWiseDatetime(pick(pos, ['datetime'])),
+    latitud: toWiseCoord(lat),
+    longitud: toWiseCoord(lng),
+    direccion: String(direccion),
+    velocidad: String(velocidad),
+    estado: (lat != null && lng != null) ? '1' : '0',
+    estado_ignicion: pick(pos, ['ignition_status']) === 'ON' ? '1' : '0',
+    numero_evento: inferWiseEvent(pos),
+  };
+}
+// Backwards compat: single-position payload (preview)
+function buildWisePayload(obj, pos) {
+  return { posicion: [buildWisePosicionItem(obj, pos)] };
+}
+
+// Tabla de estados de la respuesta Wise
+const WISE_ESTADO_MAP = {
+  1: 'OK',
+  2: 'Error de conversión',
+  3: 'Token inválido',
+  4: 'Móvil no existe o no disponible',
+  5: 'Registro duplicado',
+  6: 'Error interno',
+};
+function parseWiseEstados(body) {
+  if (!body || typeof body !== 'object') return [];
+  const rop = body?.RespuestaServicioWeb?.RespuestaOperacion;
+  if (Array.isArray(rop)) {
+    return rop.map((o) => Number(o?.ResultadoTransaccion?.Estado)).filter(Number.isFinite);
+  }
+  const e = rop?.ResultadoTransaccion?.Estado;
+  return e != null ? [Number(e)] : [];
+}
+function wiseDetailFromEstados(estados) {
+  if (!estados.length) return 'sin estado en respuesta';
+  return estados.map((e) => `${e}: ${WISE_ESTADO_MAP[e] || 'Estado ' + e}`).join(' · ');
+}
+
+async function sendOneToWise({ payload }) {
+  if (!WISE_API_TOKEN) {
+    return { ok: false, status: 0, accepted: false, response: { error: 'WISE_API_TOKEN no configurado en .env' }, url: WISE_API_URL };
+  }
+  try {
+    const r = await fetch(WISE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        Authorization: `Bearer ${WISE_API_TOKEN}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    const estados = parseWiseEstados(body);
+    const accepted = estados.length > 0 && estados.every((e) => e === 1);
+    return {
+      ok: r.ok,
+      status: r.status,
+      accepted,
+      estados,
+      message: wiseDetailFromEstados(estados),
+      response: body,
+      url: WISE_API_URL,
+    };
+  } catch (err) {
+    return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url: WISE_API_URL };
+  }
+}
+
+// ---- Wise constraints state ----
+// Vehículos marcados como "no existen en Wisetrack" (estado 4) — NO reenviar hasta que se den de alta.
+let wiseBlocked = new Set();
+async function loadWiseBlocked() {
+  try {
+    const data = JSON.parse(await fs.readFile(WISE_BLOCKED_FILE, 'utf8'));
+    wiseBlocked = new Set(data.vehicleIds || []);
+  } catch { wiseBlocked = new Set(); }
+}
+async function saveWiseBlocked() {
+  await fs.writeFile(WISE_BLOCKED_FILE, JSON.stringify({ vehicleIds: Array.from(wiseBlocked) }, null, 2), 'utf8');
+}
+await loadWiseBlocked();
+
+// En memoria: último datetime enviado por vehículo (para dedupe — no re-inyectar la misma posición)
+const wiseLastSentDatetime = new Map();
+
+const WISE_MAX_PER_REQUEST = 300;
+
+async function sendForVehiclesWise({ groupId, vehicleIds }) {
+  let ids = vehicleIds;
+  if (groupId && !ids) {
+    await ensureGroupsCache();
+    const fmGroup = groupsCache.groups.find((g) => g.id === groupId);
+    if (!fmGroup) throw new Error('grupo no existe en fm-track: ' + groupId);
+    ids = fmGroup.vehicles || [];
+  }
+  if (!ids || !ids.length) return [];
+
+  // Construir items para batch + entradas saltadas
+  const items = []; // { vehicleId, payloadItem, raw, datetime }
+  const results = [];
+  for (const vid of ids) {
+    const vidStr = String(vid);
+    if (wiseBlocked.has(vidStr)) {
+      const entry = { vehicleId: vid, ok: false, accepted: false, error: 'vehículo bloqueado (no existe en Wisetrack)', groupId };
+      await appendWiseHistory(entry);
+      results.push(entry);
+      continue;
+    }
+    try {
+      const { obj, pos } = await getPositionsForId(vid);
+      if (!pos) {
+        const entry = { vehicleId: vid, ok: false, accepted: false, error: 'sin posición en últimos 7 días', groupId };
+        await appendWiseHistory(entry);
+        results.push(entry);
+        continue;
+      }
+      const datetime = pick(pos, ['datetime']);
+      if (wiseLastSentDatetime.get(vidStr) === datetime) {
+        const entry = { vehicleId: vid, ok: true, accepted: false, skipped: true, message: 'sin cambios (mismo datetime)', groupId, raw: pos };
+        await appendWiseHistory(entry);
+        results.push(entry);
+        continue;
+      }
+      const payloadItem = buildWisePosicionItem(obj, pos);
+      items.push({ vehicleId: vid, payloadItem, raw: pos, datetime });
+    } catch (err) {
+      const entry = { vehicleId: vid, ok: false, accepted: false, error: String(err), groupId };
+      await appendWiseHistory(entry);
+      results.push(entry);
+    }
+    if (items.length >= WISE_MAX_PER_REQUEST) break; // Wise tope: 300/call
+  }
+
+  if (!items.length) return results;
+
+  // Un solo POST con todas las posiciones
+  const payload = { posicion: items.map((x) => x.payloadItem) };
+  const batchResp = await sendOneToWise({ payload });
+  const estados = batchResp.estados || [];
+
+  // Distribuir el estado a cada vehículo (Wise responde en el mismo orden enviado)
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const estado = estados[i];
+    const accepted = estado === 1;
+    if (estado === 4) {
+      // "No existe el móvil" → marcar como bloqueado y no reenviar más
+      wiseBlocked.add(String(it.vehicleId));
+    }
+    if (accepted) {
+      wiseLastSentDatetime.set(String(it.vehicleId), it.datetime);
+    }
+    const entry = {
+      vehicleId: it.vehicleId,
+      ok: batchResp.ok,
+      status: batchResp.status,
+      accepted,
+      estados: estado != null ? [estado] : [],
+      message: estado != null ? `${estado}: ${WISE_ESTADO_MAP[estado] || 'Estado ' + estado}` : 'sin estado en respuesta',
+      response: batchResp.response,
+      payload: { posicion: [it.payloadItem] },
+      raw: it.raw,
+      url: batchResp.url,
+      groupId,
+      batchSize: items.length,
+    };
+    await appendWiseHistory(entry);
+    results.push(entry);
+  }
+  await saveWiseBlocked();
+  return results;
+}
+
+app.get('/api/wise/config', (_req, res) => {
+  res.json({ url: WISE_API_URL, tokenConfigured: Boolean(WISE_API_TOKEN) });
+});
+
+app.get('/api/wise/groups', async (_req, res) => {
+  try {
+    await ensureGroupsCache();
+    const groups = {};
+    for (const g of groupsCache.groups) {
+      if (!isWiseGroupAllowed(g)) continue;
+      groups[g.id] = {
+        id: g.id,
+        name: g.name,
+        vehicles: g.vehicles || [],
+        ...defaultWiseGroupConfig(),
+        ...(wiseGroups[g.id] || {}),
+      };
+    }
+    res.json({ groups });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.put('/api/wise/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  const prev = wiseGroups[id] || defaultWiseGroupConfig();
+  const next = { ...prev };
+  if (req.body?.intervalSec != null) next.intervalSec = Math.max(5, Number(req.body.intervalSec) || 20);
+  if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
+  wiseGroups[id] = next;
+  await saveWiseGroups();
+  res.json(next);
+});
+
+app.delete('/api/wise/groups/:id', async (req, res) => {
+  delete wiseGroups[String(req.params.id)];
+  await saveWiseGroups();
+  res.json({ ok: true });
+});
+
+app.post('/api/wise/preview', async (req, res) => {
+  try {
+    const { vehicleId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ ok: false, error: 'falta vehicleId' });
+    const { obj, pos } = await getPositionsForId(vehicleId);
+    if (!pos) return res.json({ ok: false, error: 'sin última posición' });
+    res.json({ ok: true, payload: buildWisePayload(obj, pos), raw: { object: obj, position: pos } });
+  } catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+
+app.post('/api/wise/send-one', async (req, res) => {
+  try {
+    const { vehicleId, groupId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ error: 'falta vehicleId' });
+    const [r] = await sendForVehiclesWise({ vehicleIds: [vehicleId], groupId });
+    res.json(r);
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.post('/api/wise/groups/:id/send', async (req, res) => {
+  try {
+    const results = await sendForVehiclesWise({ groupId: req.params.id });
+    res.json({ results });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.get('/api/wise/blocked', (_req, res) => {
+  res.json({ vehicleIds: Array.from(wiseBlocked) });
+});
+app.delete('/api/wise/blocked/:id', async (req, res) => {
+  wiseBlocked.delete(String(req.params.id));
+  await saveWiseBlocked();
+  res.json({ ok: true });
+});
+app.post('/api/wise/blocked/clear', async (_req, res) => {
+  wiseBlocked.clear();
+  await saveWiseBlocked();
+  res.json({ ok: true });
+});
+
+app.get('/api/wise/history', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const groupId = req.query.groupId ? String(req.query.groupId) : null;
+  const raw = await fs.readFile(WISE_HISTORY_FILE, 'utf8').catch(() => '');
+  const entries = raw.trim().split('\n').filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(Boolean)
+    .filter((e) => !groupId || String(e.groupId) === groupId)
+    .slice(-limit).reverse();
+  res.json({ entries });
+});
+
+// Scheduler Wise — paralelo al de Falabella
+const WISE_TICK_MS = 2000;
+setInterval(async () => {
+  try { await ensureGroupsCache(); } catch { return; }
+  const now = Date.now();
+  for (const fmGroup of groupsCache.groups) {
+    if (!isWiseGroupAllowed(fmGroup)) continue;
+    const config = wiseGroups[fmGroup.id];
+    if (!config?.enabled) continue;
+    if (!fmGroup.vehicles?.length) continue;
+    const last = config.lastRunAt ? new Date(config.lastRunAt).getTime() : 0;
+    if (now - last < (config.intervalSec || 20) * 1000) continue;
+    config.lastRunAt = new Date().toISOString();
+    try {
+      const results = await sendForVehiclesWise({ groupId: fmGroup.id });
+      const accepted = results.filter((x) => x.accepted).length;
+      const okCount = results.filter((x) => x.ok).length;
+      const failed = results.filter((x) => !x.ok).length;
+      config.lastSummary = { total: results.length, accepted, ok: okCount, failed };
+      config.lastStatus = failed === 0 ? (accepted === results.length ? 'ok' : 'partial') : 'err';
+      await saveWiseGroups();
+    } catch (err) {
+      config.lastStatus = 'err';
+      config.lastSummary = { error: String(err) };
+      await appendLog({ kind: 'wise_scheduler_error', groupId: fmGroup.id, error: String(err) });
+      await saveWiseGroups();
+    }
+  }
+}, WISE_TICK_MS);
+
 // Loop: cada 2s revisa qué grupos fm-track con auto-envío toca disparar
 const FALABELLA_TICK_MS = 2000;
 setInterval(async () => {
   try { await ensureGroupsCache(); } catch { return; }
   const now = Date.now();
   for (const fmGroup of groupsCache.groups) {
-    if (!isGroupAllowed(fmGroup)) continue; // respeta la whitelist
+    if (!isFalabellaGroupAllowed(fmGroup)) continue; // respeta la whitelist Falabella
     const config = falabellaGroups[fmGroup.id];
     if (!config?.enabled) continue;
     if (!fmGroup.vehicles?.length) continue;
@@ -773,8 +1164,11 @@ app.listen(PORT, () => {
   if (!FM_TRACK_API_KEY) console.warn('  ⚠  FM_TRACK_API_KEY no configurada');
   if (!QA_API_TOKEN) console.warn('  ⚠  QA_API_TOKEN no configurado');
   if (!FALABELLA_APIKEY || !FALABELLA_AUTHORIZATION) console.warn('  ⚠  Credenciales Falabella TEST no configuradas');
+  if (!WISE_API_TOKEN) console.warn('  ⚠  WISE_API_TOKEN no configurado');
   const activeQ = Object.values(schedules).filter((s) => s.enabled).length;
   const activeFal = Object.values(falabellaGroups).filter((g) => g.enabled).length;
+  const activeWise = Object.values(wiseGroups).filter((g) => g.enabled).length;
   console.log(`  scheduler Q · ${activeQ} vehículos programados`);
   console.log(`  scheduler Falabella · ${activeFal}/${Object.keys(falabellaGroups).length} grupos activos`);
+  console.log(`  scheduler Wise · ${activeWise}/${Object.keys(wiseGroups).length} grupos activos`);
 });

@@ -171,6 +171,8 @@ textarea { font-family: ui-monospace, 'JetBrains Mono', Consolas, monospace; res
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 980px) { .split { grid-template-columns: 1fr; } }
+.split-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+@media (max-width: 1200px) { .split-3 { grid-template-columns: 1fr; } }
 
 .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--bg-soft); }
 .toolbar input[type=search] { min-width: 240px; }

@@ -295,10 +295,11 @@ views.resumen = async () => {
   view.innerHTML = '';
   view.appendChild(loadingCard('Cargando snapshot…'));
 
-  const [snap, qaH, faH] = await Promise.all([
+  const [snap, qaH, faH, wiH] = await Promise.all([
     loadSnapshot(),
     api('/api/schedules/history?limit=500').catch(() => ({ entries: [] })),
     api('/api/falabella/history?limit=500').catch(() => ({ entries: [] })),
+    api('/api/wise/history?limit=500').catch(() => ({ entries: [] })),
   ]);
   if (!snap) { view.innerHTML = ''; view.appendChild(emptyState('No se pudo cargar', 'Revisa los logs.')); return; }
   const okObjs = snap.objects?.ok, okPos = snap.positions?.ok;
@@ -314,6 +315,11 @@ views.resumen = async () => {
     ...(faH.entries || []).map(e => ({ ...e, kind: 'falabella', service: 'Falabella',
       patente: e.payload?.vehicleId || e.vehicleId,
       eventTs: e.payload?.timestamp, speed: e.payload?.speed?.value })),
+    ...(wiH.entries || []).map(e => ({ ...e, kind: 'wise', service: 'Wise',
+      accepted: Boolean(e.accepted),
+      patente: e.payload?.posicion?.[0]?.patente || e.vehicleId,
+      eventTs: e.payload?.posicion?.[0]?.fecha_hora,
+      speed: e.payload?.posicion?.[0]?.velocidad })),
   ].sort((a, b) => new Date(b.ts) - new Date(a.ts));
   const last24 = allSends.filter(e => new Date(e.ts).getTime() >= dayAgo);
   const accepted24 = last24.filter(e => e.accepted).length;
@@ -478,6 +484,13 @@ views.vehiculos = async () => {
       tr.addEventListener('click', () => {
         vehiculosOpenId = vehiculosOpenId === id ? null : id;
         state.selectedId = vehiculosOpenId;
+        const hint = document.getElementById('vehiculosRefreshHint');
+        if (hint) {
+          hint.textContent = vehiculosOpenId
+            ? '⏸ refresh pausado · cierra el detalle para reanudar'
+            : '';
+          hint.style.color = vehiculosOpenId ? 'var(--warn)' : 'var(--text-dim)';
+        }
         renderRows();
       });
       body.appendChild(tr);
@@ -490,6 +503,7 @@ views.vehiculos = async () => {
   view.innerHTML = '';
   view.appendChild(el('div', { class: 'card' },
     el('div', { class: 'toolbar' }, search, groupFilter, totalsBadge,
+      el('small', { id: 'vehiculosRefreshHint', style: 'color: var(--text-dim); margin-left: 8px;' }, ''),
       el('span', { style: 'flex:1' }),
       el('button', { class: 'ghost', onclick: () => { if (confirm('Borrar caché localStorage de vehículos?')) { vehicleStore.clear(); pollSnapshot(); } } }, 'Limpiar caché'),
     ),
@@ -497,10 +511,11 @@ views.vehiculos = async () => {
   ));
   renderRows();
 
-  // Auto-rerender cuando llegue nueva data
+  // Auto-rerender cuando llegue nueva data (pausa si hay un detalle abierto)
   if (vehiculosUnsub) vehiculosUnsub();
   vehiculosUnsub = vehicleStore.subscribe(() => {
     if (currentView() !== 'vehiculos') { vehiculosUnsub?.(); vehiculosUnsub = null; return; }
+    if (vehiculosOpenId) return; // pausa mientras hay un dropdown expandido
     renderRows();
   });
 };
@@ -1474,6 +1489,189 @@ function renderFalabellaGroup(g, allVehicles, cfg) {
   return cardEl;
 }
 
+// ---------- vista: Wise ----------
+views.wise = async () => {
+  $('#pageTitle').textContent = 'Wise · envío de posiciones GPS';
+  const view = $('#view');
+  view.innerHTML = '';
+  view.appendChild(loadingCard('Cargando grupos y configuración…'));
+  if (vehicleStore.list().length === 0) pollSnapshot();
+  await renderWise();
+};
+
+async function renderWise() {
+  const view = $('#view');
+  const [cfg, groupsRes] = await Promise.all([
+    api('/api/wise/config'),
+    api('/api/wise/groups'),
+  ]);
+  const groups = groupsRes.groups || {};
+  const vehicles = vehicleStore.list();
+
+  view.innerHTML = '';
+  view.appendChild(card('Configuración Wise',
+    el('div', { class: 'kv' },
+      kv('URL', cfg.url),
+      kv('Token', cfg.tokenConfigured
+        ? el('span', { class: 'badge ok' }, 'configurado')
+        : el('span', { class: 'badge err' }, 'falta WISE_API_TOKEN en .env')),
+    ),
+  ));
+
+  const groupsList = el('div');
+  const groupKeys = Object.keys(groups);
+  if (groupKeys.length === 0) {
+    groupsList.appendChild(el('div', { class: 'empty', style: 'padding: 30px 12px;' },
+      el('div', { class: 'em-title' }, 'No hay grupos asignados a Wise'),
+      'Define WISE_GROUPS en .env (ej: WISE_GROUPS=wise) y reinicia el server.'));
+  } else {
+    for (const gid of groupKeys) groupsList.appendChild(renderWiseGroup(groups[gid], vehicles));
+  }
+  view.appendChild(card('Grupos (sincronizados desde fm-track)', groupsList));
+}
+
+function renderWiseGroup(g, allVehicles) {
+  const cardEl = el('div', { class: 'card', style: 'margin-bottom: 10px;' });
+
+  const intervalInput = el('input', { type: 'number', min: '5', value: String(g.intervalSec || 20), style: 'width: 80px;' });
+  const enabledToggle = el('input', { type: 'checkbox', ...(g.enabled ? { checked: 'checked' } : {}) });
+
+  const saveDebounced = debounce(async () => {
+    await api('/api/wise/groups/' + encodeURIComponent(g.id), {
+      method: 'PUT',
+      body: JSON.stringify({
+        intervalSec: Number(intervalInput.value) || 20,
+        enabled: enabledToggle.checked,
+      }),
+    });
+  }, 400);
+  intervalInput.addEventListener('input', saveDebounced);
+  enabledToggle.addEventListener('change', saveDebounced);
+
+  // Chips de vehículos
+  const chipsBox = el('div', { style: 'display:flex; flex-wrap:wrap; gap:6px; margin:10px 0;' });
+  if (!g.vehicles?.length) {
+    chipsBox.appendChild(el('div', { class: 'empty', style: 'padding: 12px;' }, 'Grupo sin vehículos en fm-track'));
+  } else {
+    for (const vid of g.vehicles) {
+      const v = allVehicles.find((x) => String(x.id) === String(vid));
+      const label = v?.plate || v?.name || String(vid).slice(0, 8);
+      const sendOne = el('button', {
+        class: 'ghost',
+        style: 'padding:2px 7px; font-size:11px; line-height:1;',
+        title: 'Enviar este vehículo ahora',
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          sendOne.disabled = true; sendOne.textContent = '…';
+          const r = await api('/api/wise/send-one', {
+            method: 'POST', body: JSON.stringify({ vehicleId: vid, groupId: g.id }),
+          });
+          sendOne.disabled = false; sendOne.textContent = '↗';
+          const detail = r.error || (r.accepted ? '✓ aceptado' : (r.message || `HTTP ${r.status}`));
+          console.groupCollapsed(`%c[wise send-one] %c${label} → HTTP ${r.status ?? 0}`,
+            'color: #36d399; font-weight: 600;', 'color: inherit;');
+          console.log('payload:', r.payload);
+          console.log('response:', r.response);
+          console.log('estados:', r.estados);
+          if (r.error) console.warn('error:', r.error);
+          console.groupEnd();
+          toast(`${label}: ${detail}`, r.accepted ? 'ok' : 'err');
+        },
+      }, '↗');
+      const chip = el('span', {
+        style: 'display:inline-flex; align-items:center; gap:6px; padding:3px 6px 3px 10px; background:var(--bg-soft); border:1px solid var(--border); border-radius:4px; font-size:12px;',
+      }, label, sendOne);
+      chipsBox.appendChild(chip);
+    }
+  }
+
+  const sendGroupBtn = el('button', { onclick: async () => {
+    if (!g.vehicles?.length) return toast('Grupo vacío', 'err');
+    sendGroupBtn.disabled = true;
+    sendGroupBtn.textContent = `enviando ${g.vehicles.length}…`;
+    const r = await api('/api/wise/groups/' + encodeURIComponent(g.id) + '/send', {
+      method: 'POST', body: JSON.stringify({}),
+    });
+    sendGroupBtn.disabled = false; sendGroupBtn.textContent = 'Enviar grupo';
+    const results = r.results || [];
+    const accepted = results.filter((x) => x.accepted).length;
+    const failed = results.filter((x) => !x.ok).length;
+    console.groupCollapsed(`%c[wise send-group "${g.name}"] %c${accepted} aceptados · ${failed} fallidos`,
+      'color: #5b8def; font-weight: 600;', 'color: inherit;');
+    for (const x of results) {
+      console.log(`${x.vehicleId}:`, { http: x.status, accepted: x.accepted, estados: x.estados, message: x.message, payload: x.payload, error: x.error });
+    }
+    console.groupEnd();
+    toast(`Aceptados ${accepted} · fallidos ${failed}`, failed ? 'err' : 'ok');
+  } }, 'Enviar grupo');
+
+  // Badge de estado reactivo
+  const schedBadge = el('span', { class: 'badge' });
+  function refreshSchedBadge() {
+    if (enabledToggle.checked) {
+      schedBadge.className = 'badge ok';
+      schedBadge.textContent = `auto · cada ${Number(intervalInput.value) || 20}s`;
+    } else {
+      schedBadge.className = 'badge muted';
+      schedBadge.textContent = 'auto pausado';
+    }
+  }
+  refreshSchedBadge();
+  enabledToggle.addEventListener('change', refreshSchedBadge);
+  intervalInput.addEventListener('input', refreshSchedBadge);
+
+  const lastInfo = g.lastRunAt
+    ? el('small', { style: 'color: var(--text-dim);' },
+        `último: ${fmtDate(g.lastRunAt)} · ${g.lastSummary?.accepted ?? 0}/${g.lastSummary?.total ?? 0} aceptados`)
+    : el('small', { style: 'color: var(--text-dim);' }, 'sin envíos automáticos aún');
+
+  const statusLabel = el('span', { class: 'label-status' });
+  function refreshStatusLabel() {
+    statusLabel.textContent = enabledToggle.checked ? 'Enviando automáticamente' : 'Pausado';
+    statusLabel.style.color = enabledToggle.checked ? 'var(--ok)' : 'var(--text-dim)';
+  }
+  refreshStatusLabel();
+  enabledToggle.addEventListener('change', refreshStatusLabel);
+
+  const switchEl = el('label', { class: 'toggle-switch' },
+    enabledToggle, el('span', { class: 'track' }), el('span', { class: 'knob' }));
+  const toggleRow = el('div', { class: 'toggle-row' },
+    el('span', { class: 'label-main' }, 'Auto-envío'), switchEl, statusLabel,
+  );
+
+  const body = el('div', { class: 'card-body', style: 'display: none;' },
+    toggleRow,
+    el('div', { class: 'row', style: 'margin-bottom: 10px;' },
+      field('Intervalo (seg)', intervalInput),
+    ),
+    lastInfo,
+    chipsBox,
+  );
+
+  const chevron = el('span', { style: 'display: inline-block; transition: transform 0.15s; color: var(--text-dim); width: 14px;' }, '▸');
+  const header = el('div', {
+    class: 'card-header',
+    style: 'cursor: pointer; user-select: none;',
+    onclick: (ev) => {
+      if (ev.target.closest('button, input, select, label, a')) return;
+      const showing = body.style.display !== 'none';
+      body.style.display = showing ? 'none' : '';
+      chevron.style.transform = showing ? 'rotate(0deg)' : 'rotate(90deg)';
+    },
+  },
+    chevron,
+    el('span', { style: 'font-weight: 600; font-size: 0.95rem;' }, g.name || '(sin nombre)'),
+    el('span', { class: 'badge muted' }, `${g.vehicles?.length || 0} vehículos`),
+    schedBadge,
+    el('div', { class: 'spacer' }),
+    sendGroupBtn,
+  );
+
+  cardEl.appendChild(header);
+  cardEl.appendChild(body);
+  return cardEl;
+}
+
 async function loadFalabellaHistory() {
   const box = document.getElementById('falabellaHistoryBox');
   if (!box) return;
@@ -1621,6 +1819,7 @@ function buildEnviosView() {
   const serviceFilter = el('select', { style: 'min-width: 160px;' },
     el('option', { value: '' }, 'Todos los servicios'),
     el('option', { value: 'Falabella' }, 'Falabella'),
+    el('option', { value: 'Wise' }, 'Wise'),
     el('option', { value: 'Q Analytics' }, 'Q Analytics'),
   );
   const resultFilter = el('select', { style: 'min-width: 180px;' },
@@ -1670,9 +1869,10 @@ function buildEnviosView() {
 
 async function refreshEnvios() {
   if (!enviosState) return;
-  const [qaH, faH] = await Promise.all([
+  const [qaH, faH, wiH] = await Promise.all([
     api('/api/schedules/history?limit=500').catch(() => ({ entries: [] })),
     api('/api/falabella/history?limit=500').catch(() => ({ entries: [] })),
+    api('/api/wise/history?limit=500').catch(() => ({ entries: [] })),
   ]);
   const merged = [];
   for (const e of qaH.entries || []) {
@@ -1698,8 +1898,22 @@ async function refreshEnvios() {
       eventTs: e.payload?.timestamp,
       speed: e.payload?.speed?.value,
       status: e.status, ok: e.ok, accepted: Boolean(e.accepted),
-      payload: e.payload, response: e.response, error: e.error,
+      payload: e.payload, response: e.response, error: e.error, raw: e.raw,
       vehicleId: e.vehicleId, txref: e.txref, url: e.url, groupId: e.groupId,
+    });
+  }
+  for (const e of wiH.entries || []) {
+    const p0 = e.payload?.posicion?.[0];
+    merged.push({
+      kind: 'wise', service: 'Wise',
+      ts: e.ts,
+      patente: p0?.patente || e.vehicleId,
+      eventTs: p0?.fecha_hora,
+      speed: p0?.velocidad,
+      status: e.status, ok: e.ok, accepted: Boolean(e.accepted),
+      payload: e.payload, response: e.response, error: e.error, raw: e.raw,
+      vehicleId: e.vehicleId, groupId: e.groupId, url: e.url,
+      message: e.message, estados: e.estados,
     });
   }
   merged.sort((a, b) => new Date(b.ts) - new Date(a.ts));
@@ -1740,10 +1954,13 @@ function renderEnviosRows() {
       ? 'background: rgba(91,141,239,0.15); border-color: rgba(91,141,239,0.35); color: #5b8def;'
       : '';
 
+    const rawForView = e.raw ?? (e.payload?.posicion?.[0] ? null : null); // raw fm-track guardado por server
     const detailRow = el('tr', { class: 'detail-row', style: 'display: none; background: var(--bg-soft);' },
       el('td', { colspan: 7, style: 'padding: 0;' },
         el('div', { style: 'padding: 14px 16px;' },
-          el('div', { class: 'split' },
+          el('div', { class: 'split-3' },
+            renderJsonPanel('fm-track · raw',
+              rawForView ?? '(no disponible — envío anterior a esta versión)'),
             renderJsonPanel('Payload enviado', e.payload ?? '(sin payload — no se construyó)'),
             renderJsonPanel('Respuesta', e.error ? String(e.error) : (e.response ?? '')),
           ),
