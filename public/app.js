@@ -368,7 +368,7 @@ views.resumen = async () => {
   ));
   if (!recentSends.length) {
     sendsCard.appendChild(el('div', { class: 'card-body' },
-      el('div', { class: 'empty' }, 'Aún no se ha enviado nada. Activa un grupo en Q Analytics o Falabella.')));
+      el('div', { class: 'empty' }, 'Aún no se ha enviado nada. Activa el auto-envío en algún grupo para empezar.')));
   } else {
     const tbl = el('table', { class: 'tbl' },
       el('thead', {}, el('tr', {},
@@ -973,17 +973,19 @@ async function renderFalabella() {
 
   view.innerHTML = '';
 
-  // Config
-  view.appendChild(card('Configuración TMS (cliente Falabella)',
+  // Config (las credenciales viven en .env)
+  const providerOk = Boolean(cfg.defaultProvider?.dni && cfg.defaultProvider?.name);
+  view.appendChild(card('Configuración',
     el('div', { class: 'kv' },
       kv('URL Test', cfg.testUrl),
       kv('URL Prod', cfg.prodUrl),
       kv('apikey TEST', cfg.apikeyTestConfigured ? el('span', { class: 'badge ok' }, 'configurada') : el('span', { class: 'badge err' }, 'falta')),
       kv('apikey PROD', cfg.apikeyProdConfigured ? el('span', { class: 'badge ok' }, 'configurada') : el('span', { class: 'badge muted' }, 'pendiente')),
+      kv('Provider (.env)', providerOk
+        ? el('span', { class: 'badge ok' }, 'configurado')
+        : el('span', { class: 'badge warn' }, 'falta FALABELLA_PROVIDER_DNI / NAME')),
       kv('País default', cfg.defaultCountry),
       kv('User-Agent', cfg.userAgent),
-      kv('Provider DNI (.env)', cfg.defaultProvider?.dni || el('span', { class: 'badge warn' }, 'sin definir')),
-      kv('Provider nombre (.env)', cfg.defaultProvider?.name || el('span', { class: 'badge warn' }, 'sin definir')),
     ),
   ));
 
@@ -1318,18 +1320,13 @@ function renderFalabellaCatalog(vehicles, groups, cfg) {
 }
 
 function renderFalabellaGroup(g, allVehicles, cfg) {
-  const cardEl = el('div', { class: 'card', style: 'margin-bottom: 14px;' });
+  const cardEl = el('div', { class: 'card', style: 'margin-bottom: 10px;' });
 
-  // Nombre viene de fm-track — solo lectura
-  const countrySel = el('select', {}, ...['CL', 'AR', 'PE', 'CO', 'MX'].map(c =>
-    el('option', { value: c, ...(c === g.x_country ? { selected: 'selected' } : {}) }, c)));
+  // Nombre y país vienen de fm-track / .env — solo lectura
   const envSel = el('select', {},
     el('option', { value: 'test', ...(g.env === 'test' ? { selected: 'selected' } : {}) }, 'test'),
     el('option', { value: 'prod', ...(g.env === 'prod' ? { selected: 'selected' } : {}) }, 'prod'),
   );
-  const dniInput = el('input', { type: 'text', value: g.provider?.dni || '', placeholder: 'vacío = usa .env' });
-  const provNameInput = el('input', { type: 'text', value: g.provider?.name || '', placeholder: 'vacío = usa .env' });
-
   const intervalInput = el('input', { type: 'number', min: '5', value: String(g.intervalSec || 20), style: 'width: 80px;' });
   const enabledToggle = el('input', { type: 'checkbox', ...(g.enabled ? { checked: 'checked' } : {}) });
 
@@ -1337,15 +1334,14 @@ function renderFalabellaGroup(g, allVehicles, cfg) {
     await api('/api/falabella/groups/' + encodeURIComponent(g.id), {
       method: 'PUT',
       body: JSON.stringify({
-        x_country: countrySel.value, env: envSel.value,
-        provider: { dni: dniInput.value, name: provNameInput.value },
+        env: envSel.value,
         intervalSec: Number(intervalInput.value) || 20,
         enabled: enabledToggle.checked,
       }),
     });
   }, 400);
-  [dniInput, provNameInput, intervalInput].forEach(e => e.addEventListener('input', saveDebounced));
-  [countrySel, envSel, enabledToggle].forEach(e => e.addEventListener('change', saveDebounced));
+  intervalInput.addEventListener('input', saveDebounced);
+  [envSel, enabledToggle].forEach(e => e.addEventListener('change', saveDebounced));
 
   // Chips de vehículos (solo lectura — la lista la administra fm-track)
   const chipsBox = el('div', { style: 'display:flex; flex-wrap:wrap; gap:6px; margin:10px 0;' });
@@ -1414,21 +1410,10 @@ function renderFalabellaGroup(g, allVehicles, cfg) {
         `último: ${fmtDate(g.lastRunAt)} · ${g.lastSummary?.accepted ?? 0}/${g.lastSummary?.total ?? 0} aceptados`)
     : el('small', { style: 'color: var(--text-dim);' }, 'sin envíos automáticos aún');
 
-  cardEl.appendChild(el('div', { class: 'card-header' },
-    el('span', { style: 'font-weight: 600; font-size: 0.95rem;' }, g.name || '(sin nombre)'),
-    el('span', { class: 'badge muted' }, g.env || 'test'),
-    el('span', { class: 'badge muted' }, g.x_country || 'CL'),
-    el('span', { class: 'badge muted' }, `${g.vehicles?.length || 0} vehículos`),
-    schedBadge,
-    el('div', { class: 'spacer' }),
-    sendGroupBtn,
-  ));
-  cardEl.appendChild(el('div', { class: 'card-body' },
+  // Body inicialmente colapsado
+  const body = el('div', { class: 'card-body', style: 'display: none;' },
     el('div', { class: 'row', style: 'margin-bottom: 10px;' },
-      field('País', countrySel),
       field('Entorno', envSel),
-      field('Provider DNI', dniInput),
-      field('Provider nombre', provNameInput),
       field('Intervalo (seg)', intervalInput),
       el('div', { class: 'field' },
         el('label', {}, 'Auto-envío'),
@@ -1438,7 +1423,32 @@ function renderFalabellaGroup(g, allVehicles, cfg) {
     ),
     lastInfo,
     chipsBox,
-  ));
+  );
+
+  const chevron = el('span', { style: 'display: inline-block; transition: transform 0.15s; color: var(--text-dim); width: 14px;' }, '▸');
+  const header = el('div', {
+    class: 'card-header',
+    style: 'cursor: pointer; user-select: none;',
+    onclick: (ev) => {
+      // No togglear si el click fue en algo interactivo (botón, input, select, etc.)
+      if (ev.target.closest('button, input, select, label, a')) return;
+      const showing = body.style.display !== 'none';
+      body.style.display = showing ? 'none' : '';
+      chevron.style.transform = showing ? 'rotate(0deg)' : 'rotate(90deg)';
+    },
+  },
+    chevron,
+    el('span', { style: 'font-weight: 600; font-size: 0.95rem;' }, g.name || '(sin nombre)'),
+    el('span', { class: 'badge muted' }, g.env || 'test'),
+    el('span', { class: 'badge muted' }, g.x_country || 'CL'),
+    el('span', { class: 'badge muted' }, `${g.vehicles?.length || 0} vehículos`),
+    schedBadge,
+    el('div', { class: 'spacer' }),
+    sendGroupBtn,
+  );
+
+  cardEl.appendChild(header);
+  cardEl.appendChild(body);
   return cardEl;
 }
 
