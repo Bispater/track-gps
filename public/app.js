@@ -526,15 +526,9 @@ function renderDetailInline(v) {
       ] : [kv('Posición', el('span', { class: 'badge muted' }, 'sin reportes'))]),
     ),
     el('div', { class: 'split' },
-      el('div', {},
-        el('h2', { style: 'font-size: 0.9rem; margin: 0 0 8px;' }, 'fm-track · objeto crudo'),
-        el('pre', { style: 'max-height: 240px;' }, JSON.stringify(v.raw, null, 2)),
-      ),
+      renderJsonPanel('fm-track · objeto crudo', v.raw),
       v.position
-        ? el('div', {},
-            el('h2', { style: 'font-size: 0.9rem; margin: 0 0 8px;' }, 'fm-track · posición cruda'),
-            el('pre', { style: 'max-height: 240px;' }, JSON.stringify(v.position.raw, null, 2)),
-          )
+        ? renderJsonPanel('fm-track · posición cruda', v.position.raw)
         : el('div', {}),
     ),
   );
@@ -1750,17 +1744,8 @@ function renderEnviosRows() {
       el('td', { colspan: 7, style: 'padding: 0;' },
         el('div', { style: 'padding: 14px 16px;' },
           el('div', { class: 'split' },
-            el('div', {},
-              el('h2', { style: 'font-size: 0.85rem; margin: 0 0 6px; color: var(--text-dim);' }, 'Payload enviado'),
-              el('pre', { style: 'max-height: 320px; margin: 0;' },
-                e.payload ? JSON.stringify(e.payload, null, 2) : '(sin payload — no se construyó)'),
-            ),
-            el('div', {},
-              el('h2', { style: 'font-size: 0.85rem; margin: 0 0 6px; color: var(--text-dim);' }, 'Respuesta'),
-              el('pre', { style: 'max-height: 320px; margin: 0;' },
-                e.error ? String(e.error)
-                  : (typeof e.response === 'string' ? e.response : JSON.stringify(e.response, null, 2))),
-            ),
+            renderJsonPanel('Payload enviado', e.payload ?? '(sin payload — no se construyó)'),
+            renderJsonPanel('Respuesta', e.error ? String(e.error) : (e.response ?? '')),
           ),
           el('div', { class: 'kv', style: 'margin-top: 12px;' },
             kv('Servicio', e.service),
@@ -1881,6 +1866,48 @@ function compactTable(rows) {
   );
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+// Panel de JSON con título + botones "expandir" y "copiar"
+function renderJsonPanel(title, content) {
+  const text = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+  const pre = el('pre', { style: 'max-height: 240px; margin: 0;' }, text);
+
+  const expandBtn = el('button', {
+    class: 'ghost',
+    style: 'padding: 2px 8px; font-size: 11px;',
+    title: 'Expandir / contraer',
+  }, '⤢ expandir');
+  expandBtn.addEventListener('click', () => {
+    const expanded = pre.dataset.expanded === '1';
+    pre.style.maxHeight = expanded ? '240px' : 'none';
+    pre.dataset.expanded = expanded ? '0' : '1';
+    expandBtn.textContent = expanded ? '⤢ expandir' : '⤡ contraer';
+  });
+
+  const copyBtn = el('button', {
+    class: 'ghost',
+    style: 'padding: 2px 8px; font-size: 11px;',
+    title: 'Copiar al portapapeles',
+  }, '⎘ copiar');
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      const prev = copyBtn.textContent;
+      copyBtn.textContent = '✓ copiado';
+      setTimeout(() => { copyBtn.textContent = prev; }, 1400);
+    } catch (err) {
+      toast('No se pudo copiar: ' + err, 'err');
+    }
+  });
+
+  return el('div', {},
+    el('div', { style: 'display: flex; align-items: center; gap: 8px; margin-bottom: 6px;' },
+      el('h2', { style: 'font-size: 0.85rem; margin: 0; color: var(--text-dim); flex: 1;' }, title),
+      expandBtn, copyBtn,
+    ),
+    pre,
+  );
+}
 
 // ---------- router ----------
 function currentView() {

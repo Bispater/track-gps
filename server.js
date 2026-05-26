@@ -543,13 +543,8 @@ function buildFalabellaPayload(obj, pos, providerOverride) {
   const speedKmh = Number(pick(pos, ['position.speed']) ?? 0);
   const heading = Number(pick(pos, ['position.direction']) ?? 0);
   const ignited = pick(pos, ['ignition_status']) === 'ON';
-  const sensors = [];
-  for (let i = 0; i <= 3; i++) {
-    const t = pick(pos, [`device_inputs.temperature_sensor_${i}`]);
-    if (t != null && Number.isFinite(Number(t))) {
-      sensors.push({ type: 'temperature', sensor: `temperature_sensor_${i}`, value: Number(t), unit: 'C' });
-    }
-  }
+  // sensors omitidos: Falabella exige un campo `code` por sensor que la doc pública no especifica.
+  // Cuando TMS aclare el schema requerido, agregar el `code` y re-habilitar el envío.
   return {
     provider,
     vehicleId,
@@ -560,7 +555,6 @@ function buildFalabellaPayload(obj, pos, providerOverride) {
     speed: { value: speedKmh, unit: 'KILOMETER' },
     ignited,
     heading,
-    sensors,
   };
 }
 
