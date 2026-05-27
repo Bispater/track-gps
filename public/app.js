@@ -2141,7 +2141,24 @@ window.addEventListener('hashchange', route);
 $('#refreshBtn').addEventListener('click', async () => { state.snapshot = null; await route(); });
 window.addEventListener('keydown', (e) => { if (e.key === 'r' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) $('#refreshBtn').click(); });
 
+async function loadAuth() {
+  try {
+    const me = await api('/api/me');
+    if (me.authEnabled && me.username) {
+      const box = $('#authBox');
+      box.style.display = '';
+      $('#authUser').textContent = me.username;
+    }
+    $('#logoutBtn')?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      await api('/api/logout', { method: 'POST' });
+      window.location = '/login';
+    });
+  } catch {}
+}
+
 (async () => {
+  await loadAuth();
   await loadConfig();
   if (!location.hash) location.hash = '#/resumen';
   // Arranca el polling solo si la API key está cargada

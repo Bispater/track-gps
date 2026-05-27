@@ -2,7 +2,7 @@
 # Caddy automáticamente saca un certificado Let's Encrypt y lo renueva.
 # Requisito: el dominio debe apuntar al IP del VPS (registro A) ANTES del primer arranque.
 
-track.tudominio.cl {
+proaseg.cl  {
     reverse_proxy app:3000
 
     # Logs
@@ -18,8 +18,3 @@ track.tudominio.cl {
         Referrer-Policy "strict-origin-when-cross-origin"
     }
 }
-
-# Si más adelante quieres exponer otra app en el mismo dominio bajo otro subdominio:
-# otra.tudominio.cl {
-#     reverse_proxy other-app:4000
-# }
