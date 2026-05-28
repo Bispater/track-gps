@@ -1424,9 +1424,12 @@ views.explorar = async () => {
 let enviosState = null;
 let enviosEntries = [];
 let enviosTimer = null;
+const ENVIOS_PAGE_SIZE = 100;
+let enviosVisibleCount = ENVIOS_PAGE_SIZE;
 
 views.envios = async () => {
   $('#pageTitle').textContent = 'Resultados de envíos';
+  enviosVisibleCount = ENVIOS_PAGE_SIZE; // resetear paginación al entrar
   buildEnviosView();
   await refreshEnvios();
   if (enviosTimer) clearInterval(enviosTimer);
@@ -1508,8 +1511,8 @@ function buildEnviosView() {
 async function refreshEnvios() {
   if (!enviosState) return;
   const [faH, wiH] = await Promise.all([
-    api('/api/falabella/history?limit=500').catch(() => ({ entries: [] })),
-    api('/api/wise/history?limit=500').catch(() => ({ entries: [] })),
+    api('/api/falabella/history?limit=300').catch(() => ({ entries: [] })),
+    api('/api/wise/history?limit=300').catch(() => ({ entries: [] })),
   ]);
   const merged = [];
   for (const e of faH.entries || []) {
@@ -1558,15 +1561,20 @@ function renderEnviosRows() {
   else if (rf === 'rejected') rows = rows.filter(e => e.ok && !e.accepted);
   else if (rf === 'error') rows = rows.filter(e => !e.ok);
 
-  countBadge.textContent = `${rows.length} de ${enviosEntries.length} envíos`;
+  const totalFiltered = rows.length;
+  // Mostrar solo los primeros N para no saturar el DOM
+  const visibleRows = rows.slice(0, enviosVisibleCount);
+  countBadge.textContent = totalFiltered > visibleRows.length
+    ? `${visibleRows.length} de ${totalFiltered} envíos`
+    : `${totalFiltered} envíos`;
 
   body.innerHTML = '';
-  if (!rows.length) {
+  if (!visibleRows.length) {
     body.appendChild(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'Sin resultados')));
     return;
   }
 
-  for (const e of rows) {
+  for (const e of visibleRows) {
     const statusCls = !e.ok ? 'badge err' : (e.accepted ? 'badge ok' : 'badge warn');
     const statusText = e.error ? 'error red'
       : (e.accepted ? '✓ aceptado'
@@ -1623,6 +1631,18 @@ function renderEnviosRows() {
 
     body.appendChild(row);
     body.appendChild(detailRow);
+  }
+
+  // Botón "Ver más" si hay envíos ocultos por la paginación
+  const hidden = totalFiltered - visibleRows.length;
+  if (hidden > 0) {
+    const moreBtn = el('button', {
+      class: 'ghost',
+      onclick: () => { enviosVisibleCount += ENVIOS_PAGE_SIZE; renderEnviosRows(); },
+    }, `Ver más (${hidden} restante${hidden !== 1 ? 's' : ''})`);
+    body.appendChild(el('tr', {},
+      el('td', { colspan: 7, style: 'text-align: center; padding: 14px; background: var(--bg-soft);' }, moreBtn),
+    ));
   }
 }
 
@@ -1755,6 +1775,8 @@ function currentView() {
 async function route() {
   const v = currentView();
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.view === v));
+  // Limpia inmediatamente para que no quede contenido de la vista anterior visible mientras carga la nueva
+  $('#view').replaceChildren(loadingCard('Cargando…'));
   const fn = views[v] || views.resumen;
   try { await fn(); } catch (err) { $('#view').replaceChildren(emptyState('Error al renderizar', escapeHtml(String(err)))); console.error(err); }
 }
