@@ -13,8 +13,6 @@ const {
   TARGET_API_KEY = '',
   PORT = 3000,
   FM_TRACK_VERSION = '1',
-  QA_API_URL = 'https://ww3.qanalytics.cl/Api_InsertaPosicion_General_test/inserta_posiciones/',
-  QA_API_TOKEN = '',
   FALABELLA_TEST_URL = 'https://tms-uat-services.falabella.supply/api/v1/ms-tms-gps-aggregator/gps/position',
   FALABELLA_PROD_URL = 'https://tms-services.falabella.supply/api/v1/ms-tms-gps-aggregator/gps/position',
   FALABELLA_APIKEY = '',
@@ -54,8 +52,6 @@ const FM_TRACK_API_KEY = (process.env.FM_TRACK_API_KEY || '').trim().replace(/^[
 
 const LOG_DIR = path.join(__dirname, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'activity.jsonl');
-const HISTORY_FILE = path.join(LOG_DIR, 'forward-history.jsonl');
-const SCHEDULES_FILE = path.join(LOG_DIR, 'schedules.json');
 const FALABELLA_GROUPS_FILE = path.join(LOG_DIR, 'falabella-groups.json');
 const FALABELLA_HISTORY_FILE = path.join(LOG_DIR, 'falabella-history.jsonl');
 const WISE_GROUPS_FILE = path.join(LOG_DIR, 'wise-groups.json');
@@ -67,7 +63,6 @@ async function appendJsonl(file, entry) {
   await fs.appendFile(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n', 'utf8');
 }
 const appendLog = (e) => appendJsonl(LOG_FILE, e);
-const appendHistory = (e) => appendJsonl(HISTORY_FILE, e);
 
 // ---------- Retención de historiales ----------
 // Cada día se reescriben los .jsonl filtrando entries más viejos que RETENTION_DAYS.
@@ -100,7 +95,6 @@ async function pruneJsonlFile(file, days = RETENTION_DAYS) {
 async function pruneAllHistories() {
   const results = await Promise.all([
     pruneJsonlFile(LOG_FILE),
-    pruneJsonlFile(HISTORY_FILE),
     pruneJsonlFile(FALABELLA_HISTORY_FILE),
     pruneJsonlFile(WISE_HISTORY_FILE),
   ]);
@@ -221,7 +215,7 @@ async function getPositionsForId(vehicleId) {
   return { obj, pos };
 }
 
-// ---------- Q Analytics adapter ----------
+// ---------- Helpers numéricos / fechas ----------
 function clampInt(v, min, max, fb = 0) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fb;
@@ -261,115 +255,6 @@ function toIsoLocal(ts, tz) {
   const oMm = String(absMin % 60).padStart(2, '0');
   return `${parts.year}-${parts.month}-${parts.day}T${hh}:${parts.minute}:${parts.second}${sign}${oHh}:${oMm}`;
 }
-
-function buildQAPayload(obj, pos, schedule) {
-  const codVeh = String(pick(obj, ['id', 'object_id', 'uuid', 'imei']) || pick(pos, ['object_id']) || schedule?.codVeh || '');
-  // PLACA: alfanumérica sin guiones. Prioridad: schedule (editada en UI) > vehicle_params.plate_number > name > codVeh.
-  const placaRaw = schedule?.plate
-    || pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate', 'registration_number', 'name'], codVeh);
-  const placa = String(placaRaw || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 100);
-
-  const lat = round(pick(pos, ['position.latitude']), 6, 0);
-  const lon = round(pick(pos, ['position.longitude']), 6, 0);
-  const ts = toIsoUtc(pick(pos, ['datetime']));
-  const speed = clampInt(pick(pos, ['position.speed']), 0, 1000, 0);
-  const heading = clampInt(pick(pos, ['position.direction']), 0, 360, 0);
-  const sats = clampInt(pick(pos, ['position.satellites_count']), 0, 100, 0);
-  // HDOP viene en device_inputs.hdop (string como "0.5")
-  const hdopRaw = pick(pos, ['device_inputs.hdop', 'position.hdop', 'hdop']);
-  const hdop = hdopRaw != null && Number.isFinite(Number(hdopRaw))
-    ? round(Math.max(0, Math.min(100, Number(hdopRaw))), 1, 1.0)
-    : 1.0;
-  // ignition_status: "ON" | "OFF" | "UNKNOWN"
-  const ignStatus = pick(pos, ['ignition_status']);
-  const ign = ignStatus === 'ON' ? 1 : 0;
-  const alt = pick(pos, ['position.altitude']);
-
-  const payload = {
-    COD_VEH: codVeh,
-    PLACA: placa,
-    LAT: lat,
-    LON: lon,
-    FH_SVR_GPS: ts,
-    FH_RPT_GPS: ts,
-    VEL: speed,
-    SENT: heading,
-    CANT_SAT: sats,
-    HDOP: hdop,
-    IGN: ign,
-  };
-  if (alt != null && Number.isFinite(Number(alt))) {
-    payload.ALT = clampInt(alt, -2000, 100000, 999999);
-  }
-  return payload;
-}
-
-async function sendToQA(payloadArray) {
-  if (!QA_API_TOKEN) return { ok: false, status: 0, response: { error: 'QA_API_TOKEN no configurado en .env' } };
-  const r = await fetch(QA_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      Authorization: `Bearer ${QA_API_TOKEN}`,
-    },
-    body: JSON.stringify(payloadArray),
-  });
-  const text = await r.text();
-  let body; try { body = JSON.parse(text); } catch { body = text; }
-  return { ok: r.ok, status: r.status, response: body };
-}
-
-// ---------- schedules ----------
-/**
- * Estructura en disco: { [vehicleId]: { vehicleId, plate, intervalSec, enabled, lastRunAt, lastStatus } }
- */
-let schedules = {};
-async function loadSchedules() {
-  try { schedules = JSON.parse(await fs.readFile(SCHEDULES_FILE, 'utf8')); }
-  catch { schedules = {}; }
-}
-async function saveSchedules() {
-  await fs.writeFile(SCHEDULES_FILE, JSON.stringify(schedules, null, 2), 'utf8');
-}
-await loadSchedules();
-
-async function runForVehicle(vehicleId, manual = false) {
-  const sch = schedules[vehicleId];
-  let entry = { vehicleId, manual };
-  try {
-    const { obj, pos } = await getPositionsForId(vehicleId);
-    if (!obj && !sch) throw new Error('vehículo no existe en fm-track');
-    if (!pos) throw new Error('sin última posición disponible');
-    const payload = buildQAPayload(obj || {}, pos, sch);
-    const result = await sendToQA([payload]);
-    entry = { ...entry, ok: result.ok, status: result.status, payload, response: result.response };
-  } catch (err) {
-    entry = { ...entry, ok: false, status: 0, error: String(err) };
-  }
-  await appendHistory(entry);
-  if (sch) {
-    sch.lastRunAt = new Date().toISOString();
-    sch.lastStatus = entry.ok ? 'ok' : 'err';
-    sch.lastHttp = entry.status ?? 0;
-    sch.lastError = entry.error || (!entry.ok ? JSON.stringify(entry.response).slice(0, 200) : null);
-    await saveSchedules();
-  }
-  return entry;
-}
-
-// Loop: cada 2s revisa qué corresponde disparar
-const TICK_MS = 2000;
-setInterval(async () => {
-  const now = Date.now();
-  for (const [id, sch] of Object.entries(schedules)) {
-    if (!sch.enabled) continue;
-    const last = sch.lastRunAt ? new Date(sch.lastRunAt).getTime() : 0;
-    if (now - last >= (sch.intervalSec || 60) * 1000) {
-      runForVehicle(id, false).catch((e) => appendLog({ kind: 'scheduler_error', vehicleId: id, error: String(e) }));
-    }
-  }
-}, TICK_MS);
 
 // ---------- HTTP ----------
 const app = express();
@@ -473,8 +358,6 @@ app.get('/api/config', (_req, res) => {
     fmTrackKeyConfigured: Boolean(FM_TRACK_API_KEY),
     targetApiUrl: TARGET_API_URL,
     targetKeyConfigured: Boolean(TARGET_API_KEY),
-    qaApiUrl: QA_API_URL,
-    qaTokenConfigured: Boolean(QA_API_TOKEN),
   });
 });
 
@@ -532,83 +415,6 @@ app.post('/api/forward', async (req, res) => {
 });
 
 // ---- schedules API ----
-app.get('/api/schedules', async (_req, res) => {
-  try {
-    if (FM_TRACK_API_KEY) await ensurePositions().catch(() => {});
-    const vehicles = positionsCache.objects.map((o) => {
-      const id = String(pick(o, ['id', 'object_id', 'uuid', 'imei']));
-      const p = positionsCache.byId.get(id);
-      return {
-        id,
-        name: pick(o, ['name', 'label', 'description'], ''),
-        imei: pick(o, ['imei', 'identifier'], ''),
-        plate: pick(o, ['vehicle_params.plate_number', 'plate', 'license_plate', 'registration_number'], ''),
-        lastPositionAt: p ? pick(p, ['datetime']) : null,
-      };
-    });
-    res.json({ vehicles, schedules });
-  } catch (err) { res.status(500).json({ error: String(err) }); }
-});
-
-app.put('/api/schedules/:id', async (req, res) => {
-  const id = String(req.params.id);
-  const { intervalSec, enabled, plate, codVeh } = req.body ?? {};
-  const prev = schedules[id] || { vehicleId: id, intervalSec: 60, enabled: false };
-  schedules[id] = {
-    ...prev,
-    vehicleId: id,
-    ...(intervalSec != null ? { intervalSec: Math.max(5, Number(intervalSec) || 60) } : {}),
-    ...(enabled != null ? { enabled: Boolean(enabled) } : {}),
-    ...(plate != null ? { plate: String(plate) } : {}),
-    ...(codVeh != null ? { codVeh: String(codVeh) } : {}),
-  };
-  await saveSchedules();
-  res.json(schedules[id]);
-});
-
-app.delete('/api/schedules/:id', async (req, res) => {
-  delete schedules[String(req.params.id)];
-  await saveSchedules();
-  res.json({ ok: true });
-});
-
-// Construye el payload SIN enviarlo — útil para verificar el mapping con datos reales
-app.get('/api/schedules/:id/preview', async (req, res) => {
-  const id = String(req.params.id);
-  try {
-    const { obj, pos } = await getPositionsForId(id);
-    if (!pos) return res.json({ ok: false, error: 'sin última posición para este vehículo', object: obj, position: null });
-    const sch = schedules[id];
-    const payload = buildQAPayload(obj || {}, pos, sch);
-    res.json({ ok: true, payload, raw: { object: obj, position: pos } });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-app.post('/api/schedules/:id/run-now', async (req, res) => {
-  const id = String(req.params.id);
-  // Permitir override de plate antes de disparar
-  if (req.body?.plate != null) {
-    schedules[id] = { ...(schedules[id] || { vehicleId: id, intervalSec: 60, enabled: false }), plate: String(req.body.plate) };
-    await saveSchedules();
-  }
-  const r = await runForVehicle(id, true);
-  res.json(r);
-});
-
-app.get('/api/schedules/history', async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 200, 1000);
-  const vid = req.query.vehicleId ? String(req.query.vehicleId) : null;
-  const raw = await fs.readFile(HISTORY_FILE, 'utf8').catch(() => '');
-  const entries = raw.trim().split('\n').filter(Boolean)
-    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
-    .filter(Boolean)
-    .filter((e) => !vid || String(e.vehicleId) === vid)
-    .slice(-limit).reverse();
-  res.json({ entries });
-});
-
 app.get('/api/logs', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 100, 1000);
   const raw = await fs.readFile(LOG_FILE, 'utf8').catch(() => '');
@@ -1251,8 +1057,8 @@ setInterval(async () => {
 app.listen(PORT, () => {
   console.log(`track-service · http://localhost:${PORT}`);
   if (!FM_TRACK_API_KEY) console.warn('  ⚠  FM_TRACK_API_KEY no configurada');
-  if (!QA_API_TOKEN) console.warn('  ⚠  QA_API_TOKEN no configurado');
   if (!FALABELLA_APIKEY || !FALABELLA_AUTHORIZATION) console.warn('  ⚠  Credenciales Falabella TEST no configuradas');
+  if (!FALABELLA_PROD_APIKEY || !FALABELLA_PROD_AUTHORIZATION) console.warn('  ⚠  Credenciales Falabella PROD no configuradas');
   if (!WISE_API_TOKEN) console.warn('  ⚠  WISE_API_TOKEN no configurado');
   if (AUTH_ENABLED) {
     console.log(`  auth · ACTIVADA · ${AUTH_USERS.size} cuenta(s)`);
@@ -1260,10 +1066,8 @@ app.listen(PORT, () => {
   } else {
     console.warn('  ⚠  auth DESACTIVADA (sin AUTH_USERS) — la app es pública. Define AUTH_USERS en .env para protegerla.');
   }
-  const activeQ = Object.values(schedules).filter((s) => s.enabled).length;
   const activeFal = Object.values(falabellaGroups).filter((g) => g.enabled).length;
   const activeWise = Object.values(wiseGroups).filter((g) => g.enabled).length;
-  console.log(`  scheduler Q · ${activeQ} vehículos programados`);
   console.log(`  scheduler Falabella · ${activeFal}/${Object.keys(falabellaGroups).length} grupos activos`);
   console.log(`  scheduler Wise · ${activeWise}/${Object.keys(wiseGroups).length} grupos activos`);
 });

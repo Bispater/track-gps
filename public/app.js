@@ -295,9 +295,8 @@ views.resumen = async () => {
   view.innerHTML = '';
   view.appendChild(loadingCard('Cargando snapshot…'));
 
-  const [snap, qaH, faH, wiH] = await Promise.all([
+  const [snap, faH, wiH] = await Promise.all([
     loadSnapshot(),
-    api('/api/schedules/history?limit=500').catch(() => ({ entries: [] })),
     api('/api/falabella/history?limit=500').catch(() => ({ entries: [] })),
     api('/api/wise/history?limit=500').catch(() => ({ entries: [] })),
   ]);
@@ -309,9 +308,6 @@ views.resumen = async () => {
   // Métricas de envíos últimas 24h
   const dayAgo = Date.now() - 86400 * 1000;
   const allSends = [
-    ...(qaH.entries || []).map(e => ({ ...e, kind: 'qa', service: 'Q Analytics',
-      accepted: e.ok, patente: e.payload?.PLACA || e.vehicleId,
-      eventTs: e.payload?.FH_RPT_GPS, speed: e.payload?.VEL })),
     ...(faH.entries || []).map(e => ({ ...e, kind: 'falabella', service: 'Falabella',
       patente: e.payload?.vehicleId || e.vehicleId,
       eventTs: e.payload?.timestamp, speed: e.payload?.speed?.value })),
@@ -339,10 +335,6 @@ views.resumen = async () => {
         kv('fm-track GET /objects', `HTTP ${snap.objects?.status} ${okObjs ? '✓' : '✗'}`),
         kv('Última actualización', new Date(state.fetchedAt).toLocaleString('es-CL', { hour12: false })),
         kv('Base URL', state.config.fmTrackBaseUrl),
-        kv('Q Analytics token', c.qaTokenConfigured
-          ? el('span', { class: 'badge ok' }, 'configurado')
-          : el('span', { class: 'badge warn' }, 'sin token')),
-        kv('Falabella apikey TEST', el('span', { class: 'badge ok' }, 'configurada')),
       ),
     ),
     card('Vehículos recientes',
@@ -549,118 +541,6 @@ function renderDetailInline(v) {
   );
 }
 
-function renderDetail(v) {
-  const qaSection = el('div', {},
-    el('div', { class: 'empty', style: 'padding: 20px 0;' },
-      el('span', { class: 'spinner' }), ' construyendo payload Q Analytics…'),
-  );
-  loadQAPreviewInto(v.id, qaSection);
-
-  return el('div', { class: 'card' },
-    el('div', { class: 'card-header' },
-      el('h2', {}, v.name),
-      el('div', { class: 'spacer' }),
-      el('button', { class: 'ghost', onclick: () => { state.selectedId = String(v.id); location.hash = '#/reenviar'; } }, 'Ver en scheduler →'),
-    ),
-    el('div', { class: 'card-body' },
-      el('div', { class: 'kv' },
-        kv('ID', String(v.id)),
-        kv('IMEI', String(v.imei)),
-        kv('Modelo', v.model || '—'),
-        kv('Patente', v.plate || '—'),
-        ...(v.position ? [
-          kv('Latitud', fmtNum(v.position.lat, 6)),
-          kv('Longitud', fmtNum(v.position.lng, 6)),
-          kv('Velocidad', v.position.speed != null ? fmtNum(v.position.speed, 1) + ' km/h' : '—'),
-          kv('Dirección', v.position.direction != null ? fmtNum(v.position.direction, 0) + '°' : '—'),
-          kv('Altitud', v.position.altitude != null ? fmtNum(v.position.altitude, 0) + ' m' : '—'),
-          kv('Satélites', v.position.sats != null ? String(v.position.sats) : '—'),
-          kv('HDOP', v.position.hdop != null ? String(v.position.hdop) : '—'),
-          kv('Ignición', v.position.ignition || '—'),
-          kv('GPS time', fmtDate(v.position.ts)),
-        ] : [kv('Posición', el('span', { class: 'badge muted' }, 'sin reportes'))]),
-      ),
-
-      el('h2', { style: 'font-size: 0.9rem; margin: 18px 0 8px;' }, 'Payload Q Analytics'),
-      qaSection,
-
-      el('h2', { style: 'font-size: 0.9rem; margin: 18px 0 8px;' }, 'fm-track · objeto crudo'),
-      el('pre', { style: 'max-height: 240px;' }, JSON.stringify(v.raw, null, 2)),
-      v.position && el('div', {},
-        el('h2', { style: 'font-size: 0.9rem; margin: 18px 0 8px;' }, 'fm-track · posición cruda'),
-        el('pre', { style: 'max-height: 240px;' }, JSON.stringify(v.position.raw, null, 2)),
-      ),
-    ),
-  );
-}
-
-async function loadQAPreviewInto(vehicleId, container) {
-  const r = await api('/api/schedules/' + encodeURIComponent(vehicleId) + '/preview');
-  container.innerHTML = '';
-  if (!r.ok) {
-    container.appendChild(el('div', { class: 'empty' },
-      el('div', { class: 'em-title' }, 'No se puede construir payload'),
-      r.error || 'sin datos suficientes',
-    ));
-    return;
-  }
-  const p = r.payload;
-
-  const plateInput = el('input', { type: 'text', value: p.PLACA, placeholder: 'PLACA', style: 'width: 140px;' });
-  const refreshBtn = el('button', { class: 'ghost', onclick: async () => {
-    await api('/api/schedules/' + encodeURIComponent(vehicleId), {
-      method: 'PUT', body: JSON.stringify({ plate: plateInput.value }),
-    });
-    loadQAPreviewInto(vehicleId, container);
-  } }, '↻ Aplicar y recalcular');
-
-  const respPre = el('pre', { style: 'max-height: 200px;' }, '(aún no se envía)');
-  const statusBox = el('span', {});
-
-  const sendBtn = el('button', { onclick: async () => {
-    if (!state.config?.qaTokenConfigured) {
-      toast('Falta QA_API_TOKEN en .env', 'err'); return;
-    }
-    sendBtn.disabled = true; sendBtn.textContent = 'enviando…';
-    await api('/api/schedules/' + encodeURIComponent(vehicleId), {
-      method: 'PUT', body: JSON.stringify({ plate: plateInput.value }),
-    });
-    const send = await api('/api/schedules/' + encodeURIComponent(vehicleId) + '/run-now', {
-      method: 'POST', body: JSON.stringify({ plate: plateInput.value }),
-    });
-    sendBtn.disabled = false; sendBtn.textContent = 'Enviar a Q ahora';
-    statusBox.innerHTML = `<span class="badge ${send.ok ? 'ok' : 'err'}">HTTP ${send.status ?? 0}</span>`;
-    respPre.textContent = JSON.stringify(send.response ?? send, null, 2);
-    toast(`HTTP ${send.status ?? 0}`, send.ok ? 'ok' : 'err');
-  } }, 'Enviar a Q ahora');
-
-  container.appendChild(el('div', {},
-    el('div', { class: 'row', style: 'margin-bottom: 10px;' },
-      field('PLACA (editable)', plateInput),
-      refreshBtn,
-    ),
-    el('div', { class: 'kv' },
-      kv('COD_VEH', String(p.COD_VEH)),
-      kv('PLACA', String(p.PLACA)),
-      kv('LAT', String(p.LAT)),
-      kv('LON', String(p.LON)),
-      kv('FH_SVR_GPS', String(p.FH_SVR_GPS)),
-      kv('FH_RPT_GPS', String(p.FH_RPT_GPS)),
-      kv('VEL', String(p.VEL)),
-      kv('SENT', String(p.SENT)),
-      kv('CANT_SAT', String(p.CANT_SAT)),
-      kv('HDOP', String(p.HDOP)),
-      kv('IGN', String(p.IGN)),
-      ...(p.ALT != null ? [kv('ALT', String(p.ALT))] : []),
-    ),
-    el('h2', { style: 'font-size: 0.85rem; margin: 14px 0 6px; color: var(--text-dim);' }, 'JSON exacto que se POSTea'),
-    el('pre', { style: 'max-height: 200px;' }, JSON.stringify([p], null, 2)),
-    el('div', { class: 'row', style: 'margin-top: 12px;' }, sendBtn, statusBox),
-    el('h2', { style: 'font-size: 0.85rem; margin: 14px 0 6px; color: var(--text-dim);' }, 'Respuesta de Q Analytics'),
-    respPre,
-  ));
-}
-
 let mapInstance = null;
 let markerLayer = null;
 views.mapa = async () => {
@@ -700,249 +580,8 @@ views.mapa = async () => {
   if (bounds.length > 1) mapInstance.fitBounds(bounds, { padding: [40, 40] });
 };
 
-// ---------- vista: Q Analytics scheduler ----------
-let reenviarRefresh = null;
-views.reenviar = async () => {
-  $('#pageTitle').textContent = 'Q Analytics · envío programado';
-  const view = $('#view');
-  view.innerHTML = '';
-  view.appendChild(loadingCard('Cargando vehículos y programaciones…'));
-
-  await renderScheduler();
-
-  // refresco automático del historial cada 3s mientras la vista está abierta
-  if (reenviarRefresh) clearInterval(reenviarRefresh);
-  reenviarRefresh = setInterval(async () => {
-    if (currentView() !== 'reenviar') { clearInterval(reenviarRefresh); reenviarRefresh = null; return; }
-    await refreshHistoryAndStatuses();
-  }, 3000);
-};
-
-async function renderScheduler() {
-  const view = $('#view');
-  const data = await api('/api/schedules');
-  const vehicles = data.vehicles || [];
-  const schedules = data.schedules || {};
-  const cfg = state.config;
-
-  view.innerHTML = '';
-
-  // Status bar
-  view.appendChild(card('Destino',
-    el('div', { class: 'kv' },
-      kv('URL', cfg.qaApiUrl || '—'),
-      kv('Token', cfg.qaTokenConfigured
-        ? el('span', { class: 'badge ok' }, 'configurado')
-        : el('span', { class: 'badge err' }, 'falta QA_API_TOKEN en .env')),
-      kv('Vehículos disponibles', String(vehicles.length)),
-      kv('Programaciones activas', String(Object.values(schedules).filter(s => s.enabled).length)),
-    ),
-  ));
-
-  // Tabla de vehículos con controles
-  const tbl = el('table', { class: 'tbl' },
-    el('thead', {}, el('tr', {},
-      el('th', {}, 'Vehículo'),
-      el('th', {}, 'COD_VEH'),
-      el('th', {}, 'PLACA'),
-      el('th', {}, 'Intervalo (seg)'),
-      el('th', {}, 'Estado'),
-      el('th', {}, 'Última ejecución'),
-      el('th', {}, 'Acciones'),
-    )),
-  );
-  const tbody = el('tbody');
-  tbl.appendChild(tbody);
-
-  for (const v of vehicles) {
-    const sch = schedules[v.id] || { intervalSec: 60, enabled: false };
-    const plate = sch.plate ?? v.plate ?? '';
-
-    const plateInput = el('input', { type: 'text', value: plate, placeholder: 'PLACA', style: 'width: 120px;' });
-    const intervalInput = el('input', { type: 'number', min: '5', value: String(sch.intervalSec || 60), style: 'width: 90px;' });
-    const toggle = el('input', { type: 'checkbox', ...(sch.enabled ? { checked: 'checked' } : {}) });
-
-    const savePartial = debounce(async () => {
-      await api('/api/schedules/' + encodeURIComponent(v.id), {
-        method: 'PUT',
-        body: JSON.stringify({
-          plate: plateInput.value,
-          intervalSec: Number(intervalInput.value) || 60,
-          enabled: toggle.checked,
-        }),
-      });
-      toast(`${v.name || v.id}: configuración guardada`);
-    }, 400);
-
-    plateInput.addEventListener('input', savePartial);
-    intervalInput.addEventListener('input', savePartial);
-    toggle.addEventListener('change', savePartial);
-
-    const sendNowBtn = el('button', { class: 'ghost', onclick: async () => {
-      sendNowBtn.disabled = true; sendNowBtn.textContent = '…';
-      const r = await api('/api/schedules/' + encodeURIComponent(v.id) + '/run-now', {
-        method: 'POST',
-        body: JSON.stringify({ plate: plateInput.value }),
-      });
-      sendNowBtn.disabled = false; sendNowBtn.textContent = 'Enviar ahora';
-      toast(`${v.name || v.id}: HTTP ${r.status ?? 0}`, r.ok ? 'ok' : 'err');
-      await refreshHistoryAndStatuses();
-    } }, 'Enviar ahora');
-
-    const previewBtn = el('button', { class: 'ghost', onclick: async () => {
-      // guardamos la placa primero para que el preview la use
-      await api('/api/schedules/' + encodeURIComponent(v.id), {
-        method: 'PUT', body: JSON.stringify({ plate: plateInput.value }),
-      });
-      const r = await api('/api/schedules/' + encodeURIComponent(v.id) + '/preview');
-      openPreviewModal(v, r);
-    } }, 'Vista previa');
-
-    const lastBadge = sch.lastStatus === 'ok' ? el('span', { class: 'badge ok' }, `HTTP ${sch.lastHttp}`)
-      : sch.lastStatus === 'err' ? el('span', { class: 'badge err' }, `HTTP ${sch.lastHttp}`)
-      : el('span', { class: 'badge muted' }, '—');
-
-    tbody.appendChild(el('tr', { 'data-vid': v.id },
-      el('td', {}, el('div', {}, v.name || '(sin nombre)'), el('small', { style: 'color:var(--text-dim)' }, v.imei || '')),
-      el('td', {}, el('code', {}, v.id)),
-      el('td', {}, plateInput),
-      el('td', {}, intervalInput),
-      el('td', {}, el('label', { style: 'display:flex; gap:6px; align-items:center;' }, toggle, sch.enabled ? 'enviando' : 'pausado')),
-      el('td', { 'data-col': 'last' },
-        sch.lastRunAt ? el('div', {}, fmtDate(sch.lastRunAt)) : el('span', { class: 'badge muted' }, 'nunca'),
-        ' ', lastBadge),
-      el('td', {}, el('div', { class: 'row', style: 'gap: 6px; flex-wrap: nowrap;' }, sendNowBtn, previewBtn)),
-    ));
-  }
-
-  view.appendChild(card('Vehículos',
-    vehicles.length === 0 ? el('div', { class: 'empty' }, 'Sin vehículos en fm-track') : tbl,
-  ));
-
-  // Historial
-  const historyBox = el('div', { id: 'historyBox' }, el('div', { class: 'empty' }, el('span', { class: 'spinner' }), ' cargando historial…'));
-  view.appendChild(card('Historial de envíos',
-    el('div', {},
-      el('div', { class: 'row', style: 'margin-bottom: 10px;' },
-        el('button', { class: 'ghost', onclick: refreshHistoryAndStatuses }, '↻ Refrescar'),
-        el('small', { style: 'color: var(--text-dim)' }, 'se actualiza solo cada 3s'),
-      ),
-      historyBox,
-    ),
-  ));
-
-  await refreshHistoryAndStatuses();
-}
-
-async function refreshHistoryAndStatuses() {
-  // Actualizar tabla de programaciones (lastRunAt, lastStatus)
-  try {
-    const data = await api('/api/schedules');
-    for (const [id, sch] of Object.entries(data.schedules || {})) {
-      const tr = document.querySelector(`tr[data-vid="${cssEscape(id)}"]`);
-      if (!tr) continue;
-      const cell = tr.querySelector('[data-col="last"]');
-      if (!cell) continue;
-      cell.innerHTML = '';
-      cell.appendChild(sch.lastRunAt ? el('div', {}, fmtDate(sch.lastRunAt)) : el('span', { class: 'badge muted' }, 'nunca'));
-      cell.appendChild(document.createTextNode(' '));
-      const badge = sch.lastStatus === 'ok' ? el('span', { class: 'badge ok' }, `HTTP ${sch.lastHttp}`)
-        : sch.lastStatus === 'err' ? el('span', { class: 'badge err' }, `HTTP ${sch.lastHttp}`)
-        : el('span', { class: 'badge muted' }, '—');
-      cell.appendChild(badge);
-    }
-  } catch {}
-
-  // Historial
-  const box = document.getElementById('historyBox');
-  if (!box) return;
-  try {
-    const h = await api('/api/schedules/history?limit=50');
-    const entries = h.entries || [];
-    if (entries.length === 0) { box.innerHTML = '<div class="empty">sin envíos aún</div>'; return; }
-    const t = el('table', { class: 'tbl' },
-      el('thead', {}, el('tr', {},
-        el('th', {}, 'Cuándo'), el('th', {}, 'Vehículo'), el('th', {}, 'Tipo'),
-        el('th', {}, 'HTTP'), el('th', {}, 'Detalle'),
-      )),
-      el('tbody', {}, ...entries.map(e => {
-        const okCls = e.ok ? 'badge ok' : 'badge err';
-        const detail = e.error ? e.error : (typeof e.response === 'string' ? e.response : JSON.stringify(e.response || ''));
-        const row = el('tr', {},
-          el('td', {}, fmtDate(e.ts)),
-          el('td', {}, el('code', {}, String(e.vehicleId))),
-          el('td', {}, e.manual ? el('span', { class: 'badge muted' }, 'manual') : el('span', { class: 'badge muted' }, 'auto')),
-          el('td', {}, el('span', { class: okCls }, `HTTP ${e.status ?? 0}`)),
-          el('td', { style: 'max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;', title: detail }, detail.slice(0, 160)),
-        );
-        row.addEventListener('click', () => alert(JSON.stringify({ payload: e.payload, response: e.response, error: e.error }, null, 2)));
-        return row;
-      })),
-    );
-    box.innerHTML = '';
-    box.appendChild(t);
-  } catch {}
-}
-
 function debounce(fn, ms) {
   let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-}
-function cssEscape(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, (c) => '\\' + c); }
-
-function openPreviewModal(vehicle, result) {
-  const overlay = el('div', {
-    style: 'position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 9998; display: flex; align-items: center; justify-content: center; padding: 24px;',
-    onclick: (e) => { if (e.target === overlay) document.body.removeChild(overlay); },
-  });
-  const box = el('div', {
-    style: 'background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; max-width: 1100px; width: 100%; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden;',
-  });
-  const header = el('div', { class: 'card-header' },
-    el('h2', {}, `Vista previa · ${vehicle.name || vehicle.id}`),
-    el('div', { class: 'spacer' }),
-    el('button', { class: 'ghost', onclick: () => document.body.removeChild(overlay) }, 'Cerrar'),
-  );
-  const body = el('div', { style: 'padding: 18px; overflow: auto;' });
-
-  if (!result.ok) {
-    body.appendChild(el('div', { class: 'empty' },
-      el('div', { class: 'em-title' }, 'No se pudo construir el payload'),
-      el('div', {}, result.error || 'error desconocido'),
-    ));
-  } else {
-    const p = result.payload;
-    body.appendChild(el('div', {},
-      el('h2', { style: 'font-size: 0.95rem; margin: 0 0 10px;' }, 'Payload que se enviará a Q Analytics'),
-      el('div', { class: 'kv', style: 'margin-bottom: 14px;' },
-        kv('COD_VEH', String(p.COD_VEH)),
-        kv('PLACA', String(p.PLACA)),
-        kv('LAT', String(p.LAT)),
-        kv('LON', String(p.LON)),
-        kv('FH_SVR_GPS', String(p.FH_SVR_GPS)),
-        kv('FH_RPT_GPS', String(p.FH_RPT_GPS)),
-        kv('VEL (km/h)', String(p.VEL)),
-        kv('SENT (°)', String(p.SENT)),
-        kv('CANT_SAT', String(p.CANT_SAT)),
-        kv('HDOP', String(p.HDOP)),
-        kv('IGN', String(p.IGN)),
-        ...(p.ALT != null ? [kv('ALT (m)', String(p.ALT))] : []),
-      ),
-      el('pre', {}, JSON.stringify([p], null, 2)),
-      el('div', { class: 'split', style: 'margin-top: 18px;' },
-        el('div', {},
-          el('h2', { style: 'font-size: 0.9rem; margin: 0 0 6px;' }, 'fm-track · objeto crudo'),
-          el('pre', { style: 'max-height: 280px;' }, JSON.stringify(result.raw?.object, null, 2)),
-        ),
-        el('div', {},
-          el('h2', { style: 'font-size: 0.9rem; margin: 0 0 6px;' }, 'fm-track · posición cruda'),
-          el('pre', { style: 'max-height: 280px;' }, JSON.stringify(result.raw?.position, null, 2)),
-        ),
-      ),
-    ));
-  }
-
-  box.appendChild(header); box.appendChild(body); overlay.appendChild(box);
-  document.body.appendChild(overlay);
 }
 
 // ---------- vista: Falabella ----------
@@ -1781,7 +1420,7 @@ views.explorar = async () => {
   view.appendChild(card('Respuesta cruda', out));
 };
 
-// ---------- vista: Envíos (historial unificado Q Analytics + Falabella) ----------
+// ---------- vista: Envíos (historial unificado Falabella + Wise) ----------
 let enviosState = null;
 let enviosEntries = [];
 let enviosTimer = null;
@@ -1820,7 +1459,6 @@ function buildEnviosView() {
     el('option', { value: '' }, 'Todos los servicios'),
     el('option', { value: 'Falabella' }, 'Falabella'),
     el('option', { value: 'Wise' }, 'Wise'),
-    el('option', { value: 'Q Analytics' }, 'Q Analytics'),
   );
   const resultFilter = el('select', { style: 'min-width: 180px;' },
     el('option', { value: '' }, 'Todos los resultados'),
@@ -1869,27 +1507,11 @@ function buildEnviosView() {
 
 async function refreshEnvios() {
   if (!enviosState) return;
-  const [qaH, faH, wiH] = await Promise.all([
-    api('/api/schedules/history?limit=500').catch(() => ({ entries: [] })),
+  const [faH, wiH] = await Promise.all([
     api('/api/falabella/history?limit=500').catch(() => ({ entries: [] })),
     api('/api/wise/history?limit=500').catch(() => ({ entries: [] })),
   ]);
   const merged = [];
-  for (const e of qaH.entries || []) {
-    const okMsg = e.response && typeof e.response === 'object' &&
-      String(e.response.message || '').toLowerCase().includes('correct');
-    merged.push({
-      kind: 'qa', service: 'Q Analytics',
-      ts: e.ts,
-      patente: e.payload?.PLACA || e.vehicleId,
-      eventTs: e.payload?.FH_RPT_GPS,
-      speed: e.payload?.VEL,
-      status: e.status, ok: e.ok,
-      accepted: Boolean(e.ok && (okMsg || (e.status >= 200 && e.status < 300))),
-      payload: e.payload, response: e.response, error: e.error,
-      vehicleId: e.vehicleId, manual: e.manual,
-    });
-  }
   for (const e of faH.entries || []) {
     merged.push({
       kind: 'falabella', service: 'Falabella',
