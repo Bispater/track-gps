@@ -1,12 +1,11 @@
 # Override para probar sin dominio/HTTPS.
 # Uso en el VPS:
 #   docker compose -f docker-compose.yml -f docker-compose.no-tls.yml up -d --build
-# Expone la app directo en el puerto 3000 y desactiva Caddy.
-# Acceso: http://<IP-DEL-VPS>:3000
-
+# Expone el frontend (Nginx) en el puerto 80 y desactiva Caddy.
+# Nginx sirve el SPA y proxea /api al backend → acceso: http://<IP-DEL-VPS>
 services:
-  app:
+  frontend:
     ports:
-      - "3000:3000"
+      - "80:80"
   caddy:
     profiles: ["disabled"]   # Caddy no se levanta cuando se usa este override

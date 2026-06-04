@@ -1,23 +1,57 @@
+# =============================================================
+# track · stack completo (Postgres + backend + frontend + Caddy)
+# =============================================================
+# Requisito: track-frontend debe estar como carpeta hermana de track-service
+#   ~/Desktop/track-service   ← aquí corre docker compose
+#   ~/Desktop/track-frontend  ← build context del frontend (../track-frontend)
+#
+# Arranque:  docker compose up -d --build
+# Logs:      docker compose logs -f backend
 services:
-  app:
+  db:
+    image: postgres:16-alpine
+    container_name: track-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-track}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-track}
+      POSTGRES_DB: ${POSTGRES_DB:-track}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-track} -d ${POSTGRES_DB:-track}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
     build: .
-    container_name: track-service
+    container_name: track-backend
     restart: unless-stopped
     env_file: .env
     environment:
       - PORT=3000
-    volumes:
-      # Logs y schedules persistidos fuera del contenedor — sobreviven a redeploys
-      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
     expose:
       - "3000"
-    # Para correr SIN Caddy (acceso directo en puerto 3000): descomenta esta línea
+    # Para correr SIN Caddy (acceso directo a la API): descomenta
     # ports:
     #   - "3000:3000"
 
+  frontend:
+    build: ../track-frontend
+    container_name: track-frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      - backend
+
   caddy:
     image: caddy:2-alpine
-    container_name: track-service-caddy
+    container_name: track-caddy
     restart: unless-stopped
     ports:
       - "80:80"
@@ -27,8 +61,10 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - app
+      - backend
+      - frontend
 
 volumes:
+  pgdata:
   caddy_data:
   caddy_config:

@@ -1,11 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import * as db from './db.js';
 
 const {
   FM_TRACK_BASE_URL = 'https://api.fm-track.com',
@@ -30,6 +26,14 @@ const {
   WISE_API_TOKEN = '',
   WISE_GROUPS = '',
   WISE_TIMEZONE = 'America/Santiago',
+  DRIVIN_API_URL = 'https://external.driv.in/api/external/v2/positions',
+  DRIVIN_API_KEY = '',
+  DRIVIN_GROUPS = '',
+  BERMANN_API_BASE = 'https://concentrador.bermann.cl/integracion_bermann/api',
+  BERMANN_ID_CLIENTE_EXTERNO = '',
+  BERMANN_USERNAME = '',
+  BERMANN_PASSWORD = '',
+  BERMANN_GROUPS = '',
 } = process.env;
 
 function makeGroupSet(raw) {
@@ -38,6 +42,8 @@ function makeGroupSet(raw) {
 const ALLOWED_GROUPS_SET = makeGroupSet(ALLOWED_GROUPS);
 const FALABELLA_GROUPS_SET = makeGroupSet(FALABELLA_GROUPS || ALLOWED_GROUPS);
 const WISE_GROUPS_SET = makeGroupSet(WISE_GROUPS);
+const DRIVIN_GROUPS_SET = makeGroupSet(DRIVIN_GROUPS);
+const BERMANN_GROUPS_SET = makeGroupSet(BERMANN_GROUPS);
 
 function isInSet(g, set) {
   if (set.size === 0) return true;
@@ -46,61 +52,35 @@ function isInSet(g, set) {
 const isGroupAllowed = (g) => isInSet(g, ALLOWED_GROUPS_SET);
 const isFalabellaGroupAllowed = (g) => isInSet(g, FALABELLA_GROUPS_SET);
 const isWiseGroupAllowed = (g) => isInSet(g, WISE_GROUPS_SET);
+const isDrivinGroupAllowed = (g) => isInSet(g, DRIVIN_GROUPS_SET);
+const isBermannGroupAllowed = (g) => isInSet(g, BERMANN_GROUPS_SET);
 
 // Limpia llaves/espacios que muchas veces se pegan con el placeholder de la doc
-const FM_TRACK_API_KEY = (process.env.FM_TRACK_API_KEY || '').trim().replace(/^[{<\[]+|[}>\]]+$/g, '');
+const cleanKey = (s) => (s || '').trim().replace(/^[{<\[]+|[}>\]]+$/g, '');
+const FM_TRACK_API_KEY = cleanKey(process.env.FM_TRACK_API_KEY);
+// Soporte multi-tenant fm-track: hasta 4 claves adicionales (FM_TRACK_API_KEY_2, _3, _4, _5)
+const FM_TRACK_API_KEYS = [
+  FM_TRACK_API_KEY,
+  cleanKey(process.env.FM_TRACK_API_KEY_2),
+  cleanKey(process.env.FM_TRACK_API_KEY_3),
+  cleanKey(process.env.FM_TRACK_API_KEY_4),
+  cleanKey(process.env.FM_TRACK_API_KEY_5),
+].filter(Boolean);
 
-const LOG_DIR = path.join(__dirname, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'activity.jsonl');
-const FALABELLA_GROUPS_FILE = path.join(LOG_DIR, 'falabella-groups.json');
-const FALABELLA_HISTORY_FILE = path.join(LOG_DIR, 'falabella-history.jsonl');
-const WISE_GROUPS_FILE = path.join(LOG_DIR, 'wise-groups.json');
-const WISE_HISTORY_FILE = path.join(LOG_DIR, 'wise-history.jsonl');
-const WISE_BLOCKED_FILE = path.join(LOG_DIR, 'wise-blocked.json');
-await fs.mkdir(LOG_DIR, { recursive: true });
+// Inicializa Postgres (espera a que esté listo y crea el schema). Debe correr
+// antes de cualquier load* que lea de la DB.
+await db.initDb();
 
-async function appendJsonl(file, entry) {
-  await fs.appendFile(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n', 'utf8');
-}
-const appendLog = (e) => appendJsonl(LOG_FILE, e);
+const appendLog = (e) => db.appendActivity(e);
 
 // ---------- Retención de historiales ----------
-// Cada día se reescriben los .jsonl filtrando entries más viejos que RETENTION_DAYS.
+// Cada día se borran de Postgres los registros más viejos que RETENTION_DAYS.
 const RETENTION_DAYS = Math.max(1, Number(process.env.RETENTION_DAYS || 15));
 
-async function pruneJsonlFile(file, days = RETENTION_DAYS) {
-  try {
-    const raw = await fs.readFile(file, 'utf8').catch(() => '');
-    if (!raw) return { kept: 0, removed: 0 };
-    const cutoff = Date.now() - days * 86400 * 1000;
-    const lines = raw.split('\n').filter(Boolean);
-    const kept = [];
-    for (const line of lines) {
-      try {
-        const e = JSON.parse(line);
-        const ts = e.ts ? new Date(e.ts).getTime() : 0;
-        if (ts >= cutoff) kept.push(line);
-      } catch { /* línea corrupta: descartar */ }
-    }
-    if (kept.length !== lines.length) {
-      await fs.writeFile(file, kept.join('\n') + (kept.length ? '\n' : ''), 'utf8');
-    }
-    return { kept: kept.length, removed: lines.length - kept.length };
-  } catch (err) {
-    console.warn(`prune fallo en ${file}:`, String(err));
-    return { kept: 0, removed: 0, error: String(err) };
-  }
-}
-
 async function pruneAllHistories() {
-  const results = await Promise.all([
-    pruneJsonlFile(LOG_FILE),
-    pruneJsonlFile(FALABELLA_HISTORY_FILE),
-    pruneJsonlFile(WISE_HISTORY_FILE),
-  ]);
-  const totalRemoved = results.reduce((s, r) => s + (r.removed || 0), 0);
-  if (totalRemoved > 0) {
-    console.log(`[retention] purgados ${totalRemoved} entries más viejos que ${RETENTION_DAYS} días`);
+  const { removed } = await db.pruneHistory(RETENTION_DAYS);
+  if (removed > 0) {
+    console.log(`[retention] purgados ${removed} registros más viejos que ${RETENTION_DAYS} días`);
   }
 }
 
@@ -108,44 +88,90 @@ async function pruneAllHistories() {
 setTimeout(() => pruneAllHistories().catch(() => {}), 10 * 1000); // a los 10s del arranque
 setInterval(() => pruneAllHistories().catch(() => {}), 24 * 3600 * 1000);
 
-// ---------- fm-track ----------
-function buildFmTrackUrl(relPath) {
+// ---------- fm-track (multi-tenant: una API key por tenant) ----------
+function buildFmTrackUrl(relPath, apiKey = FM_TRACK_API_KEY) {
   const slash = relPath.startsWith('/') ? '' : '/';
   const url = new URL(`${FM_TRACK_BASE_URL.replace(/\/$/, '')}${slash}${relPath}`);
   if (!url.searchParams.has('version')) url.searchParams.set('version', FM_TRACK_VERSION);
-  url.searchParams.set('api_key', FM_TRACK_API_KEY);
+  url.searchParams.set('api_key', apiKey);
   return url.toString();
 }
-async function callFmTrack(relPath) {
-  const upstream = await fetch(buildFmTrackUrl(relPath), {
-    headers: { Accept: 'application/json', 'X-Api-Key': FM_TRACK_API_KEY },
+async function callFmTrack(relPath, apiKey = FM_TRACK_API_KEY) {
+  const upstream = await fetch(buildFmTrackUrl(relPath, apiKey), {
+    headers: { Accept: 'application/json', 'X-Api-Key': apiKey },
   });
   const text = await upstream.text();
   let body; try { body = JSON.parse(text); } catch { body = text; }
   return { status: upstream.status, ok: upstream.ok, data: body };
 }
 
-// fm-track no tiene endpoint bulk de "last known position": hay que iterar /objects/{id}/coordinates
-// con un rango fromDatetime/toDatetime y quedarse con el item más reciente.
-const positionsCache = { fetchedAt: 0, byId: new Map(), objects: [] };
+// Multi-tenant: cache de positions/groups por apiKey. Cada tenant fm-track tiene su propio cache.
 const POSITIONS_TTL_MS = 10000;
-const COORDS_LOOKBACK_MIN = 60; // mira la última hora para encontrar la última posición
-
-// Cache de grupos fm-track — cambian raramente, TTL más largo
-const groupsCache = { fetchedAt: 0, groups: [] };
+const COORDS_LOOKBACK_MIN = 60;
 const GROUPS_TTL_MS = 30000;
-async function ensureGroupsCache() {
-  if (Date.now() - groupsCache.fetchedAt < GROUPS_TTL_MS) return;
+
+const positionsCachesByKey = new Map();   // apiKey → { fetchedAt, byId, objects }
+const groupsCachesByKey = new Map();      // apiKey → { fetchedAt, groups }
+const vehicleKeyIndex = new Map();        // vehicleId → apiKey (qué tenant tiene este vehículo)
+const groupKeyIndex = new Map();          // groupId → apiKey (qué tenant tiene este grupo)
+
+function getPositionsCacheFor(apiKey) {
+  if (!positionsCachesByKey.has(apiKey)) {
+    positionsCachesByKey.set(apiKey, { fetchedAt: 0, byId: new Map(), objects: [] });
+  }
+  return positionsCachesByKey.get(apiKey);
+}
+function getGroupsCacheFor(apiKey) {
+  if (!groupsCachesByKey.has(apiKey)) {
+    groupsCachesByKey.set(apiKey, { fetchedAt: 0, groups: [] });
+  }
+  return groupsCachesByKey.get(apiKey);
+}
+
+// Vista agregada: alias de compatibilidad con código viejo que usaba un solo cache.
+// positionsCache.objects/byId = unión de todos los tenants.
+const positionsCache = {
+  get fetchedAt() {
+    return Math.max(0, ...Array.from(positionsCachesByKey.values()).map((c) => c.fetchedAt));
+  },
+  get objects() {
+    return Array.from(positionsCachesByKey.values()).flatMap((c) => c.objects);
+  },
+  get byId() {
+    const all = new Map();
+    for (const c of positionsCachesByKey.values()) {
+      for (const [k, v] of c.byId.entries()) all.set(k, v);
+    }
+    return all;
+  },
+};
+const groupsCache = {
+  get fetchedAt() {
+    return Math.max(0, ...Array.from(groupsCachesByKey.values()).map((c) => c.fetchedAt));
+  },
+  get groups() {
+    return Array.from(groupsCachesByKey.values()).flatMap((c) => c.groups);
+  },
+};
+
+async function ensureGroupsCacheForKey(apiKey) {
+  const cache = getGroupsCacheFor(apiKey);
+  if (Date.now() - cache.fetchedAt < GROUPS_TTL_MS) return;
   try {
-    const r = await callFmTrack('/object-groups');
+    const r = await callFmTrack('/object-groups', apiKey);
     if (!r.ok) return;
     const items = toArray(r.data?.items ?? r.data);
-    groupsCache.groups = items.map((g) => ({
+    cache.groups = items.map((g) => ({
       id: String(g.id), name: String(g.name || ''),
       vehicles: Array.isArray(g.objects_ids) ? g.objects_ids.map(String) : [],
     }));
-    groupsCache.fetchedAt = Date.now();
+    // Index para resolver tenant por groupId
+    for (const g of cache.groups) groupKeyIndex.set(g.id, apiKey);
+    cache.fetchedAt = Date.now();
   } catch {}
+}
+async function ensureGroupsCache() {
+  await Promise.all(FM_TRACK_API_KEYS.map((k) => ensureGroupsCacheForKey(k)));
 }
 
 function toArray(x) {
@@ -163,11 +189,11 @@ function pick(o, paths, fb) {
   return fb;
 }
 
-async function fetchLatestCoordinate(objectId, lookbackMin = COORDS_LOOKBACK_MIN) {
+async function fetchLatestCoordinate(objectId, lookbackMin = COORDS_LOOKBACK_MIN, apiKey = FM_TRACK_API_KEY) {
   const to = new Date().toISOString();
   const from = new Date(Date.now() - lookbackMin * 60 * 1000).toISOString();
   const path = `/objects/${encodeURIComponent(objectId)}/coordinates?fromDatetime=${encodeURIComponent(from)}&toDatetime=${encodeURIComponent(to)}`;
-  const r = await callFmTrack(path);
+  const r = await callFmTrack(path, apiKey);
   if (!r.ok) return null;
   const items = toArray(r.data?.items ?? r.data);
   if (!items.length) return null;
@@ -175,40 +201,48 @@ async function fetchLatestCoordinate(objectId, lookbackMin = COORDS_LOOKBACK_MIN
   return items[0];
 }
 
-async function refreshPositionsCache() {
-  const objsRes = await callFmTrack('/objects');
-  if (!objsRes.ok) throw new Error(`fm-track /objects → HTTP ${objsRes.status}`);
-  positionsCache.objects = toArray(objsRes.data);
+async function refreshPositionsCacheForKey(apiKey) {
+  const cache = getPositionsCacheFor(apiKey);
+  const objsRes = await callFmTrack('/objects', apiKey);
+  if (!objsRes.ok) throw new Error(`fm-track /objects (key ${apiKey.slice(0, 6)}…) → HTTP ${objsRes.status}`);
+  cache.objects = toArray(objsRes.data);
 
-  const ids = positionsCache.objects
-    .map((o) => pick(o, ['id', 'object_id', 'uuid', 'imei']))
-    .filter(Boolean);
+  const ids = cache.objects.map((o) => pick(o, ['id', 'object_id', 'uuid', 'imei'])).filter(Boolean);
+  // Index para resolver tenant por vehicleId
+  for (const id of ids) vehicleKeyIndex.set(String(id), apiKey);
 
-  const results = await Promise.allSettled(ids.map((id) => fetchLatestCoordinate(id).then((p) => [String(id), p])));
-
-  positionsCache.byId = new Map();
+  const results = await Promise.allSettled(
+    ids.map((id) => fetchLatestCoordinate(id, COORDS_LOOKBACK_MIN, apiKey).then((p) => [String(id), p]))
+  );
+  cache.byId = new Map();
   for (const r of results) {
-    if (r.status === 'fulfilled' && r.value && r.value[1]) {
-      positionsCache.byId.set(r.value[0], r.value[1]);
-    }
+    if (r.status === 'fulfilled' && r.value && r.value[1]) cache.byId.set(r.value[0], r.value[1]);
   }
-  positionsCache.fetchedAt = Date.now();
+  cache.fetchedAt = Date.now();
 }
 
 async function ensurePositions() {
-  if (Date.now() - positionsCache.fetchedAt > POSITIONS_TTL_MS) {
-    await refreshPositionsCache();
-  }
+  // Refresca caches vencidas de TODOS los tenants en paralelo
+  await Promise.all(FM_TRACK_API_KEYS.map(async (apiKey) => {
+    const cache = getPositionsCacheFor(apiKey);
+    if (Date.now() - cache.fetchedAt > POSITIONS_TTL_MS) {
+      try { await refreshPositionsCacheForKey(apiKey); } catch (e) {
+        await appendLog({ kind: 'fm_track_refresh_error', apiKey: apiKey.slice(0, 6) + '…', error: String(e) });
+      }
+    }
+  }));
 }
 
 async function getPositionsForId(vehicleId) {
   await ensurePositions();
-  const obj = positionsCache.objects.find((o) => String(pick(o, ['id', 'object_id', 'uuid', 'imei'])) === String(vehicleId));
-  // Si la caché bulk no tiene posición, escalar la ventana: 1h → 24h → 7d
-  let pos = positionsCache.byId.get(String(vehicleId));
+  const vidStr = String(vehicleId);
+  const apiKey = vehicleKeyIndex.get(vidStr) || FM_TRACK_API_KEY;
+  const cache = getPositionsCacheFor(apiKey);
+  const obj = cache.objects.find((o) => String(pick(o, ['id', 'object_id', 'uuid', 'imei'])) === vidStr);
+  let pos = cache.byId.get(vidStr);
   if (!pos) {
     for (const minutes of [COORDS_LOOKBACK_MIN, 24 * 60, 7 * 24 * 60]) {
-      pos = await fetchLatestCoordinate(vehicleId, minutes);
+      pos = await fetchLatestCoordinate(vehicleId, minutes, apiKey);
       if (pos) break;
     }
   }
@@ -316,9 +350,11 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ba, bb);
 }
 
-// Rutas abiertas (no requieren login)
-app.get('/login', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
+// Rutas abiertas (no requieren login). El frontend (Angular) lo sirve Nginx en
+// su propio contenedor; este servicio expone SOLO la API y el login.
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
+// Healthcheck (sin auth) — lo usa el HEALTHCHECK de Docker y Caddy.
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
@@ -341,16 +377,13 @@ app.get('/api/me', (req, res) => {
   res.json({ authEnabled: AUTH_ENABLED, authenticated: Boolean(user), username: user || null });
 });
 
-// Middleware: protege todo lo demás
+// Middleware: protege todo lo demás (API-only → siempre 401 JSON si no hay sesión)
 app.use((req, res, next) => {
   if (!AUTH_ENABLED) return next();
   const user = verifyToken(getCookie(req, AUTH_COOKIE));
   if (user) { req.user = user; return next(); }
-  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'no autenticado' });
-  return res.redirect('/login');
+  return res.status(401).json({ error: 'no autenticado' });
 });
-
-app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/config', (_req, res) => {
   res.json({
@@ -391,7 +424,10 @@ app.get('/api/snapshot', async (_req, res) => {
 app.get('/api/fm-track/groups/:id', async (req, res) => {
   if (!FM_TRACK_API_KEY) return res.status(500).json({ error: 'FM_TRACK_API_KEY no configurada' });
   try {
-    const r = await callFmTrack('/object-groups/' + encodeURIComponent(req.params.id));
+    await ensureGroupsCache();
+    const id = req.params.id;
+    const apiKey = groupKeyIndex.get(id) || FM_TRACK_API_KEY;
+    const r = await callFmTrack('/object-groups/' + encodeURIComponent(id), apiKey);
     res.status(r.status).json(r);
   } catch (err) { res.status(502).json({ error: String(err) }); }
 });
@@ -417,14 +453,12 @@ app.post('/api/forward', async (req, res) => {
 // ---- schedules API ----
 app.get('/api/logs', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 100, 1000);
-  const raw = await fs.readFile(LOG_FILE, 'utf8').catch(() => '');
-  const entries = raw.trim().split('\n').filter(Boolean).slice(-limit).reverse()
-    .map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+  const entries = await db.getActivity(limit);
   res.json({ entries });
 });
 
 // ===================== Falabella =====================
-const appendFalabellaHistory = (e) => appendJsonl(FALABELLA_HISTORY_FILE, e);
+const appendFalabellaHistory = (e) => db.appendHistory('falabella', e);
 
 // falabellaGroups ahora guarda SOLO la configuración de envío por id de fm-track group
 // (intervalSec, enabled, env, x_country, provider override, lastRunAt, lastSummary).
@@ -443,20 +477,10 @@ function defaultGroupConfig() {
   };
 }
 async function loadFalabellaGroups() {
-  try { falabellaGroups = JSON.parse(await fs.readFile(FALABELLA_GROUPS_FILE, 'utf8')); }
-  catch { falabellaGroups = {}; }
-  // Migración: descartar entradas con id local (g_*) — ahora usamos ids de fm-track directamente.
-  let dropped = 0;
-  for (const k of Object.keys(falabellaGroups)) {
-    if (k.startsWith('g_')) { delete falabellaGroups[k]; dropped++; }
-  }
-  if (dropped > 0) {
-    console.log(`[migration] eliminadas ${dropped} entradas locales antiguas (ahora se usan ids de fm-track)`);
-    await saveFalabellaGroups();
-  }
+  falabellaGroups = await db.loadGroupConfigs('falabella');
 }
 async function saveFalabellaGroups() {
-  await fs.writeFile(FALABELLA_GROUPS_FILE, JSON.stringify(falabellaGroups, null, 2), 'utf8');
+  await db.saveGroupConfigs('falabella', falabellaGroups);
 }
 await loadFalabellaGroups();
 
@@ -567,14 +591,9 @@ async function sendForVehicles({ groupId, vehicleIds, env, x_country, providerOv
 app.get('/api/fm-track/groups', async (_req, res) => {
   if (!FM_TRACK_API_KEY) return res.status(500).json({ error: 'FM_TRACK_API_KEY no configurada' });
   try {
-    const r = await callFmTrack('/object-groups');
-    if (!r.ok) return res.status(r.status).json({ error: 'fm-track devolvió ' + r.status, data: r.data });
-    const items = toArray(r.data?.items ?? r.data);
-    const groups = items.map((g) => ({
-      id: String(g.id),
-      name: String(g.name || ''),
-      vehicles: Array.isArray(g.objects_ids) ? g.objects_ids.map(String) : [],
-    })).filter(isGroupAllowed);
+    // Devuelve la unión de grupos de todos los tenants fm-track configurados
+    await ensureGroupsCache();
+    const groups = groupsCache.groups.filter(isGroupAllowed);
     res.json({ groups });
   } catch (err) { res.status(502).json({ error: String(err) }); }
 });
@@ -627,8 +646,9 @@ app.put('/api/falabella/groups/:id', async (req, res) => {
 
 // Resetea la config (vuelve a defaults) — la lista de vehículos no cambia, viene siempre de fm-track.
 app.delete('/api/falabella/groups/:id', async (req, res) => {
-  delete falabellaGroups[String(req.params.id)];
-  await saveFalabellaGroups();
+  const id = String(req.params.id);
+  delete falabellaGroups[id];
+  await db.deleteGroupConfig('falabella', id);
   res.json({ ok: true });
 });
 
@@ -663,17 +683,12 @@ app.post('/api/falabella/groups/:id/send', async (req, res) => {
 app.get('/api/falabella/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   const groupId = req.query.groupId ? String(req.query.groupId) : null;
-  const raw = await fs.readFile(FALABELLA_HISTORY_FILE, 'utf8').catch(() => '');
-  const entries = raw.trim().split('\n').filter(Boolean)
-    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
-    .filter(Boolean)
-    .filter((e) => !groupId || String(e.groupId) === groupId)
-    .slice(-limit).reverse();
+  const entries = await db.getHistory('falabella', { limit, groupId });
   res.json({ entries });
 });
 
 // ===================== Wise (Wisetrack) =====================
-const appendWiseHistory = (e) => appendJsonl(WISE_HISTORY_FILE, e);
+const appendWiseHistory = (e) => db.appendHistory('wise', e);
 
 let wiseGroups = {};
 function defaultWiseGroupConfig() {
@@ -681,11 +696,10 @@ function defaultWiseGroupConfig() {
   return { intervalSec: 30, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
 }
 async function loadWiseGroups() {
-  try { wiseGroups = JSON.parse(await fs.readFile(WISE_GROUPS_FILE, 'utf8')); }
-  catch { wiseGroups = {}; }
+  wiseGroups = await db.loadGroupConfigs('wise');
 }
 async function saveWiseGroups() {
-  await fs.writeFile(WISE_GROUPS_FILE, JSON.stringify(wiseGroups, null, 2), 'utf8');
+  await db.saveGroupConfigs('wise', wiseGroups);
 }
 await loadWiseGroups();
 
@@ -801,13 +815,7 @@ async function sendOneToWise({ payload }) {
 // Vehículos marcados como "no existen en Wisetrack" (estado 4) — NO reenviar hasta que se den de alta.
 let wiseBlocked = new Set();
 async function loadWiseBlocked() {
-  try {
-    const data = JSON.parse(await fs.readFile(WISE_BLOCKED_FILE, 'utf8'));
-    wiseBlocked = new Set(data.vehicleIds || []);
-  } catch { wiseBlocked = new Set(); }
-}
-async function saveWiseBlocked() {
-  await fs.writeFile(WISE_BLOCKED_FILE, JSON.stringify({ vehicleIds: Array.from(wiseBlocked) }, null, 2), 'utf8');
+  wiseBlocked = await db.loadBlocked('wise');
 }
 await loadWiseBlocked();
 
@@ -877,6 +885,7 @@ async function sendForVehiclesWise({ groupId, vehicleIds }) {
     if (estado === 4) {
       // "No existe el móvil" → marcar como bloqueado y no reenviar más
       wiseBlocked.add(String(it.vehicleId));
+      await db.addBlocked('wise', it.vehicleId, 'no existe en Wisetrack (estado 4)');
     }
     if (accepted) {
       wiseLastSentDatetime.set(String(it.vehicleId), it.datetime);
@@ -898,7 +907,6 @@ async function sendForVehiclesWise({ groupId, vehicleIds }) {
     await appendWiseHistory(entry);
     results.push(entry);
   }
-  await saveWiseBlocked();
   return results;
 }
 
@@ -936,8 +944,9 @@ app.put('/api/wise/groups/:id', async (req, res) => {
 });
 
 app.delete('/api/wise/groups/:id', async (req, res) => {
-  delete wiseGroups[String(req.params.id)];
-  await saveWiseGroups();
+  const id = String(req.params.id);
+  delete wiseGroups[id];
+  await db.deleteGroupConfig('wise', id);
   res.json({ ok: true });
 });
 
@@ -971,25 +980,21 @@ app.get('/api/wise/blocked', (_req, res) => {
   res.json({ vehicleIds: Array.from(wiseBlocked) });
 });
 app.delete('/api/wise/blocked/:id', async (req, res) => {
-  wiseBlocked.delete(String(req.params.id));
-  await saveWiseBlocked();
+  const id = String(req.params.id);
+  wiseBlocked.delete(id);
+  await db.removeBlocked('wise', id);
   res.json({ ok: true });
 });
 app.post('/api/wise/blocked/clear', async (_req, res) => {
   wiseBlocked.clear();
-  await saveWiseBlocked();
+  await db.clearBlocked('wise');
   res.json({ ok: true });
 });
 
 app.get('/api/wise/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   const groupId = req.query.groupId ? String(req.query.groupId) : null;
-  const raw = await fs.readFile(WISE_HISTORY_FILE, 'utf8').catch(() => '');
-  const entries = raw.trim().split('\n').filter(Boolean)
-    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
-    .filter(Boolean)
-    .filter((e) => !groupId || String(e.groupId) === groupId)
-    .slice(-limit).reverse();
+  const entries = await db.getHistory('wise', { limit, groupId });
   res.json({ entries });
 });
 
@@ -1054,12 +1059,530 @@ setInterval(async () => {
   }
 }, FALABELLA_TICK_MS);
 
+// ===================== Drivin =====================
+const appendDrivinHistory = (e) => db.appendHistory('drivin', e);
+
+let drivinGroups = {};
+function defaultDrivinGroupConfig() {
+  return { intervalSec: 30, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
+}
+async function loadDrivinGroups() {
+  drivinGroups = await db.loadGroupConfigs('drivin');
+}
+async function saveDrivinGroups() {
+  await db.saveGroupConfigs('drivin', drivinGroups);
+}
+await loadDrivinGroups();
+
+// Adapter Drivin: payload con root "_json", "lng" minúscula, timestamp en segundos, speed en m/s.
+function buildDrivinPositionItem(obj, pos) {
+  const deviceNumber = String(pick(obj, ['id', 'object_id']) || '').slice(0, 255);
+  const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
+  const vehicleCode = String(plateRaw || '').slice(0, 255);
+  const lat = Number(pick(pos, ['position.latitude']));
+  const lng = Number(pick(pos, ['position.longitude']));
+  const dtRaw = pick(pos, ['datetime']);
+  const tsMs = dtRaw ? new Date(dtRaw).getTime() : Date.now();
+  // Drivin espera timestamp en SEGUNDOS, no milisegundos
+  const timestamp = Math.floor((Number.isFinite(tsMs) ? tsMs : Date.now()) / 1000);
+  const speedKmh = Number(pick(pos, ['position.speed']) ?? 0);
+  const heading = Number(pick(pos, ['position.direction']) ?? 0);
+
+  const item = {
+    device_number: deviceNumber,
+    lat: Number.isFinite(lat) ? lat : 0,
+    lng: Number.isFinite(lng) ? lng : 0,
+    timestamp,
+  };
+  if (vehicleCode) item.vehicle_code = vehicleCode;
+  // speed en m/s (fm-track lo da en km/h)
+  if (Number.isFinite(speedKmh)) item.speed = round(speedKmh / 3.6, 2);
+  if (Number.isFinite(heading)) item.heading = heading;
+
+  // Temperaturas 1-indexed (temp1..temp4) según el ejemplo de la doc
+  const temperature = {};
+  for (let i = 0; i <= 3; i++) {
+    const t = pick(pos, [`device_inputs.temperature_sensor_${i}`]);
+    if (t != null && Number.isFinite(Number(t))) temperature[`temp${i + 1}`] = Number(t);
+  }
+  if (Object.keys(temperature).length) item.temperature = temperature;
+
+  return item;
+}
+function buildDrivinPayload(obj, pos) {
+  return { _json: [buildDrivinPositionItem(obj, pos)] };
+}
+
+async function sendOneToDrivin({ payload }) {
+  if (!DRIVIN_API_KEY) {
+    return { ok: false, status: 0, accepted: false, response: { error: 'DRIVIN_API_KEY no configurado en .env' }, url: DRIVIN_API_URL };
+  }
+  try {
+    const r = await fetch(DRIVIN_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-API-Key': DRIVIN_API_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    // 201 + { success: true, status: "OK" }
+    const accepted = r.status === 201 && body && typeof body === 'object' && body.success === true;
+    return { ok: r.ok, status: r.status, accepted, response: body, url: DRIVIN_API_URL };
+  } catch (err) {
+    return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url: DRIVIN_API_URL };
+  }
+}
+
+async function sendForVehiclesDrivin({ groupId, vehicleIds }) {
+  let ids = vehicleIds;
+  if (groupId && !ids) {
+    await ensureGroupsCache();
+    const fmGroup = groupsCache.groups.find((g) => g.id === groupId);
+    if (!fmGroup) throw new Error('grupo no existe en fm-track: ' + groupId);
+    ids = fmGroup.vehicles || [];
+  }
+  if (!ids || !ids.length) return [];
+
+  const items = [];
+  const results = [];
+  for (const vid of ids) {
+    try {
+      const { obj, pos } = await getPositionsForId(vid);
+      if (!pos) {
+        const entry = { vehicleId: vid, ok: false, accepted: false, error: 'sin posición en últimos 7 días', groupId };
+        await appendDrivinHistory(entry);
+        results.push(entry);
+        continue;
+      }
+      items.push({ vehicleId: vid, payloadItem: buildDrivinPositionItem(obj, pos), raw: pos });
+    } catch (err) {
+      const entry = { vehicleId: vid, ok: false, accepted: false, error: String(err), groupId };
+      await appendDrivinHistory(entry);
+      results.push(entry);
+    }
+  }
+  if (!items.length) return results;
+
+  const payload = { _json: items.map((x) => x.payloadItem) };
+  const batchResp = await sendOneToDrivin({ payload });
+
+  // Drivin no devuelve resultado por posición; el accepted del batch se aplica a todas.
+  for (const it of items) {
+    const entry = {
+      vehicleId: it.vehicleId,
+      ok: batchResp.ok,
+      status: batchResp.status,
+      accepted: batchResp.accepted,
+      response: batchResp.response,
+      payload: { _json: [it.payloadItem] },
+      raw: it.raw,
+      url: batchResp.url,
+      groupId,
+      batchSize: items.length,
+    };
+    await appendDrivinHistory(entry);
+    results.push(entry);
+  }
+  return results;
+}
+
+app.get('/api/drivin/config', (_req, res) => {
+  res.json({ url: DRIVIN_API_URL, keyConfigured: Boolean(DRIVIN_API_KEY) });
+});
+
+app.get('/api/drivin/groups', async (_req, res) => {
+  try {
+    await ensureGroupsCache();
+    const groups = {};
+    for (const g of groupsCache.groups) {
+      if (!isDrivinGroupAllowed(g)) continue;
+      groups[g.id] = {
+        id: g.id, name: g.name,
+        vehicles: g.vehicles || [],
+        ...defaultDrivinGroupConfig(),
+        ...(drivinGroups[g.id] || {}),
+      };
+    }
+    res.json({ groups });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.put('/api/drivin/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  const prev = drivinGroups[id] || defaultDrivinGroupConfig();
+  const next = { ...prev };
+  if (req.body?.intervalSec != null) next.intervalSec = Math.max(5, Number(req.body.intervalSec) || 30);
+  if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
+  drivinGroups[id] = next;
+  await saveDrivinGroups();
+  res.json(next);
+});
+
+app.delete('/api/drivin/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  delete drivinGroups[id];
+  await db.deleteGroupConfig('drivin', id);
+  res.json({ ok: true });
+});
+
+app.post('/api/drivin/preview', async (req, res) => {
+  try {
+    const { vehicleId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ ok: false, error: 'falta vehicleId' });
+    const { obj, pos } = await getPositionsForId(vehicleId);
+    if (!pos) return res.json({ ok: false, error: 'sin última posición' });
+    res.json({ ok: true, payload: buildDrivinPayload(obj, pos), raw: { object: obj, position: pos } });
+  } catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+
+app.post('/api/drivin/send-one', async (req, res) => {
+  try {
+    const { vehicleId, groupId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ error: 'falta vehicleId' });
+    const [r] = await sendForVehiclesDrivin({ vehicleIds: [vehicleId], groupId });
+    res.json(r);
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.post('/api/drivin/groups/:id/send', async (req, res) => {
+  try {
+    const results = await sendForVehiclesDrivin({ groupId: req.params.id });
+    res.json({ results });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.get('/api/drivin/history', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const groupId = req.query.groupId ? String(req.query.groupId) : null;
+  const entries = await db.getHistory('drivin', { limit, groupId });
+  res.json({ entries });
+});
+
+// Scheduler Drivin
+const DRIVIN_TICK_MS = 2000;
+setInterval(async () => {
+  try { await ensureGroupsCache(); } catch { return; }
+  const now = Date.now();
+  for (const fmGroup of groupsCache.groups) {
+    if (!isDrivinGroupAllowed(fmGroup)) continue;
+    const config = drivinGroups[fmGroup.id];
+    if (!config?.enabled) continue;
+    if (!fmGroup.vehicles?.length) continue;
+    const last = config.lastRunAt ? new Date(config.lastRunAt).getTime() : 0;
+    if (now - last < (config.intervalSec || 30) * 1000) continue;
+    config.lastRunAt = new Date().toISOString();
+    try {
+      const results = await sendForVehiclesDrivin({ groupId: fmGroup.id });
+      const accepted = results.filter((x) => x.accepted).length;
+      const okCount = results.filter((x) => x.ok).length;
+      const failed = results.filter((x) => !x.ok).length;
+      config.lastSummary = { total: results.length, accepted, ok: okCount, failed };
+      config.lastStatus = failed === 0 ? (accepted === results.length ? 'ok' : 'partial') : 'err';
+      await saveDrivinGroups();
+    } catch (err) {
+      config.lastStatus = 'err';
+      config.lastSummary = { error: String(err) };
+      await appendLog({ kind: 'drivin_scheduler_error', groupId: fmGroup.id, error: String(err) });
+      await saveDrivinGroups();
+    }
+  }
+}, DRIVIN_TICK_MS);
+
+// ===================== Bermann =====================
+const appendBermannHistory = (e) => db.appendHistory('bermann', e);
+
+let bermannGroups = {};
+function defaultBermannGroupConfig() {
+  return { intervalSec: 30, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
+}
+async function loadBermannGroups() {
+  bermannGroups = await db.loadGroupConfigs('bermann');
+}
+async function saveBermannGroups() {
+  await db.saveGroupConfigs('bermann', bermannGroups);
+}
+await loadBermannGroups();
+
+// Token cache: dura 1h según la doc; refrescamos a los 55 min para evitar race conditions.
+let bermannToken = null;
+let bermannTokenExpiresAt = 0;
+let bermannAuthInFlight = null; // Promise que evita múltiples auth simultáneos
+
+async function getBermannToken({ forceRefresh = false } = {}) {
+  if (!forceRefresh && bermannToken && Date.now() < bermannTokenExpiresAt) return bermannToken;
+  if (bermannAuthInFlight) return bermannAuthInFlight;
+  bermannAuthInFlight = (async () => {
+    if (!BERMANN_ID_CLIENTE_EXTERNO || !BERMANN_USERNAME || !BERMANN_PASSWORD) {
+      throw new Error('Credenciales Bermann no configuradas (.env: BERMANN_ID_CLIENTE_EXTERNO, BERMANN_USERNAME, BERMANN_PASSWORD)');
+    }
+    const r = await fetch(BERMANN_API_BASE.replace(/\/$/, '') + '/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        id_cliente_externo: Number(BERMANN_ID_CLIENTE_EXTERNO),
+        nombre_usuario: BERMANN_USERNAME,
+        password_usuario: BERMANN_PASSWORD,
+      }),
+    });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    if (!r.ok || !body || !body.access_token) {
+      throw new Error(`Auth Bermann falló: HTTP ${r.status} · ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    }
+    bermannToken = body.access_token;
+    bermannTokenExpiresAt = Date.now() + 55 * 60 * 1000; // 55 min de margen sobre la hora real
+    return bermannToken;
+  })().finally(() => { bermannAuthInFlight = null; });
+  return bermannAuthInFlight;
+}
+
+// Inserta guión entre letras y dígitos: "GKYS15" → "GKYS-15", "JL8953" → "JL-8953"
+function plateWithHyphen(plate) {
+  const cleaned = String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const m = cleaned.match(/^([A-Z]+)(\d+)$/);
+  return m ? `${m[1]}-${m[2]}` : cleaned;
+}
+// Formato UTC "yyyy-MM-dd HH:mm:ss"
+function toBermannDatetime(ts) {
+  let d = new Date(ts || Date.now());
+  if (isNaN(d.getTime())) d = new Date();
+  // Regla de negocio: no enviar fechas adelantadas a la actual
+  const now = new Date();
+  if (d.getTime() > now.getTime()) d = now;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function buildBermannPayload(obj, pos) {
+  const imei = String(pick(obj, ['imei', 'identifier']) || '');
+  const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
+  const patente = plateWithHyphen(plateRaw);
+  const lat = pick(pos, ['position.latitude']);
+  const lon = pick(pos, ['position.longitude']);
+  const dt = pick(pos, ['datetime']);
+  const speedKmh = Number(pick(pos, ['position.speed']) ?? 0);
+  const heading = clampInt(pick(pos, ['position.direction']), 0, 360, 0);
+  const altitude = Number(pick(pos, ['position.altitude']) ?? 0);
+  const ign = pick(pos, ['ignition_status']) === 'ON' ? 1 : 0;
+  const sats = clampInt(pick(pos, ['position.satellites_count']), 0, 100, 0);
+  const hdopRaw = pick(pos, ['device_inputs.hdop']);
+  const hdop = hdopRaw != null && Number.isFinite(Number(hdopRaw)) ? Number(hdopRaw) : 0;
+  const voltage = pick(pos, ['device_inputs.power_supply_voltage']);
+  // power_supply_voltage de fm-track viene en mV; pasar a V para "voltaje_externo"
+  const voltExt = voltage != null && Number.isFinite(Number(voltage)) ? round(Number(voltage) / 1000, 2) : null;
+
+  const payload = {
+    fecha: toBermannDatetime(dt),
+    imei,
+    patente,
+    latitud: String(lat != null ? Number(lat) : ''),
+    longitud: String(lon != null ? Number(lon) : ''),
+    orientacion: heading,
+    velocidad: round(speedKmh, 2),
+    id_cliente_externo: Number(BERMANN_ID_CLIENTE_EXTERNO) || 0,
+    altitud: Number.isFinite(altitude) ? Math.round(altitude) : 0,
+    estado_motor: ign,
+    hdop,
+    num_sat: sats,
+  };
+  if (voltExt != null) payload.voltaje_externo = voltExt;
+  return payload;
+}
+
+async function sendOneToBermann({ payload }) {
+  if (!BERMANN_ID_CLIENTE_EXTERNO || !BERMANN_USERNAME || !BERMANN_PASSWORD) {
+    return { ok: false, status: 0, accepted: false, response: { error: 'Credenciales Bermann no configuradas en .env' }, url: BERMANN_API_BASE };
+  }
+  const url = BERMANN_API_BASE.replace(/\/$/, '') + '/data/insert';
+  let token;
+  try { token = await getBermannToken(); }
+  catch (err) { return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url }; }
+
+  async function postOnce(t) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: `Bearer ${t}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    return { r, body };
+  }
+
+  try {
+    let { r, body } = await postOnce(token);
+    // Si el token expiró (401/403), refrescar y reintentar una vez
+    if (r.status === 401 || r.status === 403) {
+      bermannToken = null; bermannTokenExpiresAt = 0;
+      try { token = await getBermannToken({ forceRefresh: true }); }
+      catch (err) { return { ok: false, status: r.status, accepted: false, response: { error: 'auth refresh fallo: ' + err.message }, url }; }
+      ({ r, body } = await postOnce(token));
+    }
+    return { ok: r.ok, status: r.status, accepted: r.ok, response: body, url };
+  } catch (err) {
+    return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url };
+  }
+}
+
+async function sendForVehiclesBermann({ groupId, vehicleIds }) {
+  let ids = vehicleIds;
+  if (groupId && !ids) {
+    await ensureGroupsCache();
+    const fmGroup = groupsCache.groups.find((g) => g.id === groupId);
+    if (!fmGroup) throw new Error('grupo no existe en fm-track: ' + groupId);
+    ids = fmGroup.vehicles || [];
+  }
+  if (!ids || !ids.length) return [];
+  const results = [];
+  // Bermann acepta UN objeto por request (no array), así que iteramos
+  for (const vid of ids) {
+    try {
+      const { obj, pos } = await getPositionsForId(vid);
+      if (!pos) {
+        const entry = { vehicleId: vid, ok: false, accepted: false, error: 'sin posición en últimos 7 días', groupId };
+        await appendBermannHistory(entry);
+        results.push(entry);
+        continue;
+      }
+      const payload = buildBermannPayload(obj, pos);
+      const r = await sendOneToBermann({ payload });
+      const entry = { vehicleId: vid, ...r, payload, raw: pos, groupId };
+      await appendBermannHistory(entry);
+      results.push(entry);
+    } catch (err) {
+      const entry = { vehicleId: vid, ok: false, accepted: false, error: String(err), groupId };
+      await appendBermannHistory(entry);
+      results.push(entry);
+    }
+  }
+  return results;
+}
+
+app.get('/api/bermann/config', (_req, res) => {
+  res.json({
+    url: BERMANN_API_BASE,
+    credentialsConfigured: Boolean(BERMANN_ID_CLIENTE_EXTERNO && BERMANN_USERNAME && BERMANN_PASSWORD),
+    idClienteExterno: BERMANN_ID_CLIENTE_EXTERNO || null,
+    tokenCached: Boolean(bermannToken && Date.now() < bermannTokenExpiresAt),
+    tokenExpiresAt: bermannToken ? new Date(bermannTokenExpiresAt).toISOString() : null,
+  });
+});
+
+app.get('/api/bermann/groups', async (_req, res) => {
+  try {
+    await ensureGroupsCache();
+    const groups = {};
+    for (const g of groupsCache.groups) {
+      if (!isBermannGroupAllowed(g)) continue;
+      groups[g.id] = {
+        id: g.id, name: g.name,
+        vehicles: g.vehicles || [],
+        ...defaultBermannGroupConfig(),
+        ...(bermannGroups[g.id] || {}),
+      };
+    }
+    res.json({ groups });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.put('/api/bermann/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  const prev = bermannGroups[id] || defaultBermannGroupConfig();
+  const next = { ...prev };
+  if (req.body?.intervalSec != null) next.intervalSec = Math.max(5, Number(req.body.intervalSec) || 30);
+  if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
+  bermannGroups[id] = next;
+  await saveBermannGroups();
+  res.json(next);
+});
+
+app.delete('/api/bermann/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  delete bermannGroups[id];
+  await db.deleteGroupConfig('bermann', id);
+  res.json({ ok: true });
+});
+
+app.post('/api/bermann/preview', async (req, res) => {
+  try {
+    const { vehicleId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ ok: false, error: 'falta vehicleId' });
+    const { obj, pos } = await getPositionsForId(vehicleId);
+    if (!pos) return res.json({ ok: false, error: 'sin última posición' });
+    res.json({ ok: true, payload: buildBermannPayload(obj, pos), raw: { object: obj, position: pos } });
+  } catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+
+app.post('/api/bermann/send-one', async (req, res) => {
+  try {
+    const { vehicleId, groupId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ error: 'falta vehicleId' });
+    const [r] = await sendForVehiclesBermann({ vehicleIds: [vehicleId], groupId });
+    res.json(r);
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.post('/api/bermann/groups/:id/send', async (req, res) => {
+  try {
+    const results = await sendForVehiclesBermann({ groupId: req.params.id });
+    res.json({ results });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.get('/api/bermann/history', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const groupId = req.query.groupId ? String(req.query.groupId) : null;
+  const entries = await db.getHistory('bermann', { limit, groupId });
+  res.json({ entries });
+});
+
+// Scheduler Bermann
+const BERMANN_TICK_MS = 2000;
+setInterval(async () => {
+  try { await ensureGroupsCache(); } catch { return; }
+  const now = Date.now();
+  for (const fmGroup of groupsCache.groups) {
+    if (!isBermannGroupAllowed(fmGroup)) continue;
+    const config = bermannGroups[fmGroup.id];
+    if (!config?.enabled) continue;
+    if (!fmGroup.vehicles?.length) continue;
+    const last = config.lastRunAt ? new Date(config.lastRunAt).getTime() : 0;
+    if (now - last < (config.intervalSec || 30) * 1000) continue;
+    config.lastRunAt = new Date().toISOString();
+    try {
+      const results = await sendForVehiclesBermann({ groupId: fmGroup.id });
+      const accepted = results.filter((x) => x.accepted).length;
+      const okCount = results.filter((x) => x.ok).length;
+      const failed = results.filter((x) => !x.ok).length;
+      config.lastSummary = { total: results.length, accepted, ok: okCount, failed };
+      config.lastStatus = failed === 0 ? (accepted === results.length ? 'ok' : 'partial') : 'err';
+      await saveBermannGroups();
+    } catch (err) {
+      config.lastStatus = 'err';
+      config.lastSummary = { error: String(err) };
+      await appendLog({ kind: 'bermann_scheduler_error', groupId: fmGroup.id, error: String(err) });
+      await saveBermannGroups();
+    }
+  }
+}, BERMANN_TICK_MS);
+
 app.listen(PORT, () => {
   console.log(`track-service · http://localhost:${PORT}`);
   if (!FM_TRACK_API_KEY) console.warn('  ⚠  FM_TRACK_API_KEY no configurada');
+  console.log(`  fm-track · ${FM_TRACK_API_KEYS.length} tenant(s) configurado(s)`);
   if (!FALABELLA_APIKEY || !FALABELLA_AUTHORIZATION) console.warn('  ⚠  Credenciales Falabella TEST no configuradas');
   if (!FALABELLA_PROD_APIKEY || !FALABELLA_PROD_AUTHORIZATION) console.warn('  ⚠  Credenciales Falabella PROD no configuradas');
   if (!WISE_API_TOKEN) console.warn('  ⚠  WISE_API_TOKEN no configurado');
+  if (!DRIVIN_API_KEY) console.warn('  ⚠  DRIVIN_API_KEY no configurado');
+  if (!BERMANN_ID_CLIENTE_EXTERNO || !BERMANN_USERNAME || !BERMANN_PASSWORD) console.warn('  ⚠  Credenciales Bermann no configuradas');
   if (AUTH_ENABLED) {
     console.log(`  auth · ACTIVADA · ${AUTH_USERS.size} cuenta(s)`);
     if (!process.env.AUTH_SECRET) console.warn('  ⚠  AUTH_SECRET no definido — las sesiones se invalidan en cada reinicio. Define AUTH_SECRET en .env.');
@@ -1068,6 +1591,10 @@ app.listen(PORT, () => {
   }
   const activeFal = Object.values(falabellaGroups).filter((g) => g.enabled).length;
   const activeWise = Object.values(wiseGroups).filter((g) => g.enabled).length;
+  const activeDrivin = Object.values(drivinGroups).filter((g) => g.enabled).length;
+  const activeBermann = Object.values(bermannGroups).filter((g) => g.enabled).length;
   console.log(`  scheduler Falabella · ${activeFal}/${Object.keys(falabellaGroups).length} grupos activos`);
   console.log(`  scheduler Wise · ${activeWise}/${Object.keys(wiseGroups).length} grupos activos`);
+  console.log(`  scheduler Drivin · ${activeDrivin}/${Object.keys(drivinGroups).length} grupos activos`);
+  console.log(`  scheduler Bermann · ${activeBermann}/${Object.keys(bermannGroups).length} grupos activos`);
 });

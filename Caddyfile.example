@@ -2,8 +2,18 @@
 # Caddy automáticamente saca un certificado Let's Encrypt y lo renueva.
 # Requisito: el dominio debe apuntar al IP del VPS (registro A) ANTES del primer arranque.
 
-proaseg.cl  {
-    reverse_proxy app:3000
+proaseg.cl {
+    # La API y el login van al backend Node/Express
+    handle /api/* {
+        reverse_proxy backend:3000
+    }
+
+    # Todo lo demás (el SPA Angular, incl. /login, /resumen, …) lo sirve Nginx
+    handle {
+        reverse_proxy frontend:80
+    }
+
+    encode gzip
 
     # Logs
     log {

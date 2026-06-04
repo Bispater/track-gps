@@ -295,10 +295,12 @@ views.resumen = async () => {
   view.innerHTML = '';
   view.appendChild(loadingCard('Cargando snapshot…'));
 
-  const [snap, faH, wiH] = await Promise.all([
+  const [snap, faH, wiH, drH, bermH] = await Promise.all([
     loadSnapshot(),
     api('/api/falabella/history?limit=500').catch(() => ({ entries: [] })),
     api('/api/wise/history?limit=500').catch(() => ({ entries: [] })),
+    api('/api/drivin/history?limit=500').catch(() => ({ entries: [] })),
+    api('/api/bermann/history?limit=500').catch(() => ({ entries: [] })),
   ]);
   if (!snap) { view.innerHTML = ''; view.appendChild(emptyState('No se pudo cargar', 'Revisa los logs.')); return; }
   const okObjs = snap.objects?.ok, okPos = snap.positions?.ok;
@@ -316,6 +318,20 @@ views.resumen = async () => {
       patente: e.payload?.posicion?.[0]?.patente || e.vehicleId,
       eventTs: e.payload?.posicion?.[0]?.fecha_hora,
       speed: e.payload?.posicion?.[0]?.velocidad })),
+    ...(drH.entries || []).map(e => {
+      const p0 = e.payload?._json?.[0] || e.payload?.positions?.[0];
+      return { ...e, kind: 'drivin', service: 'Drivin',
+        accepted: Boolean(e.accepted),
+        patente: p0?.vehicle_code || e.vehicleId,
+        eventTs: p0?.timestamp ? new Date(Number(p0.timestamp) * 1000).toISOString() : null,
+        speed: p0?.speed,
+      };
+    }),
+    ...(bermH.entries || []).map(e => ({ ...e, kind: 'bermann', service: 'Bermann',
+      accepted: Boolean(e.accepted),
+      patente: e.payload?.patente || e.vehicleId,
+      eventTs: e.payload?.fecha,
+      speed: e.payload?.velocidad })),
   ].sort((a, b) => new Date(b.ts) - new Date(a.ts));
   const last24 = allSends.filter(e => new Date(e.ts).getTime() >= dayAgo);
   const accepted24 = last24.filter(e => e.accepted).length;
@@ -1311,6 +1327,370 @@ function renderWiseGroup(g, allVehicles) {
   return cardEl;
 }
 
+// ---------- vista: Drivin ----------
+views.drivin = async () => {
+  $('#pageTitle').textContent = 'Drivin · envío de posiciones GPS';
+  const view = $('#view');
+  view.innerHTML = '';
+  view.appendChild(loadingCard('Cargando grupos y configuración…'));
+  if (vehicleStore.list().length === 0) pollSnapshot();
+  await renderDrivin();
+};
+
+async function renderDrivin() {
+  const view = $('#view');
+  const [cfg, groupsRes] = await Promise.all([
+    api('/api/drivin/config'),
+    api('/api/drivin/groups'),
+  ]);
+  const groups = groupsRes.groups || {};
+  const vehicles = vehicleStore.list();
+
+  view.innerHTML = '';
+  view.appendChild(card('Configuración Drivin',
+    el('div', { class: 'kv' },
+      kv('URL', cfg.url),
+      kv('X-API-Key', cfg.keyConfigured
+        ? el('span', { class: 'badge ok' }, 'configurado')
+        : el('span', { class: 'badge err' }, 'falta DRIVIN_API_KEY en .env')),
+    ),
+  ));
+
+  const groupsList = el('div');
+  const groupKeys = Object.keys(groups);
+  if (groupKeys.length === 0) {
+    groupsList.appendChild(el('div', { class: 'empty', style: 'padding: 30px 12px;' },
+      el('div', { class: 'em-title' }, 'No hay grupos asignados a Drivin'),
+      'Define DRIVIN_GROUPS en .env (ej: DRIVIN_GROUPS=DRIVIN) y reinicia el server.'));
+  } else {
+    for (const gid of groupKeys) groupsList.appendChild(renderDrivinGroup(groups[gid], vehicles));
+  }
+  view.appendChild(card('Grupos (sincronizados desde fm-track)', groupsList));
+}
+
+function renderDrivinGroup(g, allVehicles) {
+  const cardEl = el('div', { class: 'card', style: 'margin-bottom: 10px;' });
+
+  const intervalInput = el('input', { type: 'number', min: '5', value: String(g.intervalSec || 30), style: 'width: 80px;' });
+  const enabledToggle = el('input', { type: 'checkbox', ...(g.enabled ? { checked: 'checked' } : {}) });
+
+  const saveDebounced = debounce(async () => {
+    await api('/api/drivin/groups/' + encodeURIComponent(g.id), {
+      method: 'PUT',
+      body: JSON.stringify({
+        intervalSec: Number(intervalInput.value) || 30,
+        enabled: enabledToggle.checked,
+      }),
+    });
+  }, 400);
+  intervalInput.addEventListener('input', saveDebounced);
+  enabledToggle.addEventListener('change', saveDebounced);
+
+  // Chips de vehículos
+  const chipsBox = el('div', { style: 'display:flex; flex-wrap:wrap; gap:6px; margin:10px 0;' });
+  if (!g.vehicles?.length) {
+    chipsBox.appendChild(el('div', { class: 'empty', style: 'padding: 12px;' }, 'Grupo sin vehículos en fm-track'));
+  } else {
+    for (const vid of g.vehicles) {
+      const v = allVehicles.find((x) => String(x.id) === String(vid));
+      const label = v?.plate || v?.name || String(vid).slice(0, 8);
+      const sendOne = el('button', {
+        class: 'ghost',
+        style: 'padding:2px 7px; font-size:11px; line-height:1;',
+        title: 'Enviar este vehículo ahora',
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          sendOne.disabled = true; sendOne.textContent = '…';
+          const r = await api('/api/drivin/send-one', {
+            method: 'POST', body: JSON.stringify({ vehicleId: vid, groupId: g.id }),
+          });
+          sendOne.disabled = false; sendOne.textContent = '↗';
+          const detail = r.error || (r.accepted ? '✓ aceptado' : `HTTP ${r.status}`);
+          console.groupCollapsed(`%c[drivin send-one] %c${label} → HTTP ${r.status ?? 0}`,
+            'color: #36d399; font-weight: 600;', 'color: inherit;');
+          console.log('payload:', r.payload);
+          console.log('response:', r.response);
+          if (r.error) console.warn('error:', r.error);
+          console.groupEnd();
+          toast(`${label}: ${detail}`, r.accepted ? 'ok' : 'err');
+        },
+      }, '↗');
+      const chip = el('span', {
+        style: 'display:inline-flex; align-items:center; gap:6px; padding:3px 6px 3px 10px; background:var(--bg-soft); border:1px solid var(--border); border-radius:4px; font-size:12px;',
+      }, label, sendOne);
+      chipsBox.appendChild(chip);
+    }
+  }
+
+  const sendGroupBtn = el('button', { onclick: async () => {
+    if (!g.vehicles?.length) return toast('Grupo vacío', 'err');
+    sendGroupBtn.disabled = true;
+    sendGroupBtn.textContent = `enviando ${g.vehicles.length}…`;
+    const r = await api('/api/drivin/groups/' + encodeURIComponent(g.id) + '/send', {
+      method: 'POST', body: JSON.stringify({}),
+    });
+    sendGroupBtn.disabled = false; sendGroupBtn.textContent = 'Enviar grupo';
+    const results = r.results || [];
+    const accepted = results.filter((x) => x.accepted).length;
+    const failed = results.filter((x) => !x.ok).length;
+    console.groupCollapsed(`%c[drivin send-group "${g.name}"] %c${accepted} aceptados · ${failed} fallidos`,
+      'color: #5b8def; font-weight: 600;', 'color: inherit;');
+    for (const x of results) {
+      console.log(`${x.vehicleId}:`, { http: x.status, accepted: x.accepted, response: x.response, payload: x.payload, error: x.error });
+    }
+    console.groupEnd();
+    toast(`Aceptados ${accepted} · fallidos ${failed}`, failed ? 'err' : 'ok');
+  } }, 'Enviar grupo');
+
+  const schedBadge = el('span', { class: 'badge' });
+  function refreshSchedBadge() {
+    if (enabledToggle.checked) {
+      schedBadge.className = 'badge ok';
+      schedBadge.textContent = `auto · cada ${Number(intervalInput.value) || 30}s`;
+    } else {
+      schedBadge.className = 'badge muted';
+      schedBadge.textContent = 'auto pausado';
+    }
+  }
+  refreshSchedBadge();
+  enabledToggle.addEventListener('change', refreshSchedBadge);
+  intervalInput.addEventListener('input', refreshSchedBadge);
+
+  const lastInfo = g.lastRunAt
+    ? el('small', { style: 'color: var(--text-dim);' },
+        `último: ${fmtDate(g.lastRunAt)} · ${g.lastSummary?.accepted ?? 0}/${g.lastSummary?.total ?? 0} aceptados`)
+    : el('small', { style: 'color: var(--text-dim);' }, 'sin envíos automáticos aún');
+
+  const statusLabel = el('span', { class: 'label-status' });
+  function refreshStatusLabel() {
+    statusLabel.textContent = enabledToggle.checked ? 'Enviando automáticamente' : 'Pausado';
+    statusLabel.style.color = enabledToggle.checked ? 'var(--ok)' : 'var(--text-dim)';
+  }
+  refreshStatusLabel();
+  enabledToggle.addEventListener('change', refreshStatusLabel);
+
+  const switchEl = el('label', { class: 'toggle-switch' },
+    enabledToggle, el('span', { class: 'track' }), el('span', { class: 'knob' }));
+  const toggleRow = el('div', { class: 'toggle-row' },
+    el('span', { class: 'label-main' }, 'Auto-envío'), switchEl, statusLabel,
+  );
+
+  const body = el('div', { class: 'card-body', style: 'display: none;' },
+    toggleRow,
+    el('div', { class: 'row', style: 'margin-bottom: 10px;' },
+      field('Intervalo (seg)', intervalInput),
+    ),
+    lastInfo,
+    chipsBox,
+  );
+
+  const chevron = el('span', { style: 'display: inline-block; transition: transform 0.15s; color: var(--text-dim); width: 14px;' }, '▸');
+  const header = el('div', {
+    class: 'card-header',
+    style: 'cursor: pointer; user-select: none;',
+    onclick: (ev) => {
+      if (ev.target.closest('button, input, select, label, a')) return;
+      const showing = body.style.display !== 'none';
+      body.style.display = showing ? 'none' : '';
+      chevron.style.transform = showing ? 'rotate(0deg)' : 'rotate(90deg)';
+    },
+  },
+    chevron,
+    el('span', { style: 'font-weight: 600; font-size: 0.95rem;' }, g.name || '(sin nombre)'),
+    el('span', { class: 'badge muted' }, `${g.vehicles?.length || 0} vehículos`),
+    schedBadge,
+    el('div', { class: 'spacer' }),
+    sendGroupBtn,
+  );
+
+  cardEl.appendChild(header);
+  cardEl.appendChild(body);
+  return cardEl;
+}
+
+// ---------- vista: Bermann ----------
+views.bermann = async () => {
+  $('#pageTitle').textContent = 'Bermann · envío de posiciones GPS';
+  const view = $('#view');
+  view.innerHTML = '';
+  view.appendChild(loadingCard('Cargando grupos y configuración…'));
+  if (vehicleStore.list().length === 0) pollSnapshot();
+  await renderBermann();
+};
+
+async function renderBermann() {
+  const view = $('#view');
+  const [cfg, groupsRes] = await Promise.all([
+    api('/api/bermann/config'),
+    api('/api/bermann/groups'),
+  ]);
+  const groups = groupsRes.groups || {};
+  const vehicles = vehicleStore.list();
+
+  view.innerHTML = '';
+  view.appendChild(card('Configuración Bermann',
+    el('div', { class: 'kv' },
+      kv('URL base', cfg.url),
+      kv('Credenciales', cfg.credentialsConfigured
+        ? el('span', { class: 'badge ok' }, 'configuradas')
+        : el('span', { class: 'badge err' }, 'falta BERMANN_ID_CLIENTE_EXTERNO / USERNAME / PASSWORD')),
+      kv('id_cliente_externo', String(cfg.idClienteExterno ?? '—')),
+      kv('Token cacheado', cfg.tokenCached
+        ? el('span', { class: 'badge ok' }, `vence ${fmtDate(cfg.tokenExpiresAt)}`)
+        : el('span', { class: 'badge muted' }, 'sin token (se pedirá al primer envío)')),
+    ),
+  ));
+
+  const groupsList = el('div');
+  const groupKeys = Object.keys(groups);
+  if (groupKeys.length === 0) {
+    groupsList.appendChild(el('div', { class: 'empty', style: 'padding: 30px 12px;' },
+      el('div', { class: 'em-title' }, 'No hay grupos asignados a Bermann'),
+      'Define BERMANN_GROUPS en .env (ej: BERMANN_GROUPS=BERMANN) y reinicia el server.'));
+  } else {
+    for (const gid of groupKeys) groupsList.appendChild(renderBermannGroup(groups[gid], vehicles));
+  }
+  view.appendChild(card('Grupos (sincronizados desde fm-track)', groupsList));
+}
+
+function renderBermannGroup(g, allVehicles) {
+  const cardEl = el('div', { class: 'card', style: 'margin-bottom: 10px;' });
+  const intervalInput = el('input', { type: 'number', min: '5', value: String(g.intervalSec || 30), style: 'width: 80px;' });
+  const enabledToggle = el('input', { type: 'checkbox', ...(g.enabled ? { checked: 'checked' } : {}) });
+
+  const saveDebounced = debounce(async () => {
+    await api('/api/bermann/groups/' + encodeURIComponent(g.id), {
+      method: 'PUT',
+      body: JSON.stringify({
+        intervalSec: Number(intervalInput.value) || 30,
+        enabled: enabledToggle.checked,
+      }),
+    });
+  }, 400);
+  intervalInput.addEventListener('input', saveDebounced);
+  enabledToggle.addEventListener('change', saveDebounced);
+
+  const chipsBox = el('div', { style: 'display:flex; flex-wrap:wrap; gap:6px; margin:10px 0;' });
+  if (!g.vehicles?.length) {
+    chipsBox.appendChild(el('div', { class: 'empty', style: 'padding: 12px;' }, 'Grupo sin vehículos en fm-track'));
+  } else {
+    for (const vid of g.vehicles) {
+      const v = allVehicles.find((x) => String(x.id) === String(vid));
+      const label = v?.plate || v?.name || String(vid).slice(0, 8);
+      const sendOne = el('button', {
+        class: 'ghost',
+        style: 'padding:2px 7px; font-size:11px; line-height:1;',
+        title: 'Enviar este vehículo ahora',
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          sendOne.disabled = true; sendOne.textContent = '…';
+          const r = await api('/api/bermann/send-one', {
+            method: 'POST', body: JSON.stringify({ vehicleId: vid, groupId: g.id }),
+          });
+          sendOne.disabled = false; sendOne.textContent = '↗';
+          const detail = r.error || (r.accepted ? '✓ aceptado' : `HTTP ${r.status}`);
+          console.groupCollapsed(`%c[bermann send-one] %c${label} → HTTP ${r.status ?? 0}`,
+            'color: #36d399; font-weight: 600;', 'color: inherit;');
+          console.log('payload:', r.payload);
+          console.log('response:', r.response);
+          if (r.error) console.warn('error:', r.error);
+          console.groupEnd();
+          toast(`${label}: ${detail}`, r.accepted ? 'ok' : 'err');
+        },
+      }, '↗');
+      const chip = el('span', {
+        style: 'display:inline-flex; align-items:center; gap:6px; padding:3px 6px 3px 10px; background:var(--bg-soft); border:1px solid var(--border); border-radius:4px; font-size:12px;',
+      }, label, sendOne);
+      chipsBox.appendChild(chip);
+    }
+  }
+
+  const sendGroupBtn = el('button', { onclick: async () => {
+    if (!g.vehicles?.length) return toast('Grupo vacío', 'err');
+    sendGroupBtn.disabled = true;
+    sendGroupBtn.textContent = `enviando ${g.vehicles.length}…`;
+    const r = await api('/api/bermann/groups/' + encodeURIComponent(g.id) + '/send', {
+      method: 'POST', body: JSON.stringify({}),
+    });
+    sendGroupBtn.disabled = false; sendGroupBtn.textContent = 'Enviar grupo';
+    const results = r.results || [];
+    const accepted = results.filter((x) => x.accepted).length;
+    const failed = results.filter((x) => !x.ok).length;
+    console.groupCollapsed(`%c[bermann send-group "${g.name}"] %c${accepted} aceptados · ${failed} fallidos`,
+      'color: #5b8def; font-weight: 600;', 'color: inherit;');
+    for (const x of results) {
+      console.log(`${x.vehicleId}:`, { http: x.status, accepted: x.accepted, response: x.response, payload: x.payload, error: x.error });
+    }
+    console.groupEnd();
+    toast(`Aceptados ${accepted} · fallidos ${failed}`, failed ? 'err' : 'ok');
+  } }, 'Enviar grupo');
+
+  const schedBadge = el('span', { class: 'badge' });
+  function refreshSchedBadge() {
+    if (enabledToggle.checked) {
+      schedBadge.className = 'badge ok';
+      schedBadge.textContent = `auto · cada ${Number(intervalInput.value) || 30}s`;
+    } else {
+      schedBadge.className = 'badge muted';
+      schedBadge.textContent = 'auto pausado';
+    }
+  }
+  refreshSchedBadge();
+  enabledToggle.addEventListener('change', refreshSchedBadge);
+  intervalInput.addEventListener('input', refreshSchedBadge);
+
+  const lastInfo = g.lastRunAt
+    ? el('small', { style: 'color: var(--text-dim);' },
+        `último: ${fmtDate(g.lastRunAt)} · ${g.lastSummary?.accepted ?? 0}/${g.lastSummary?.total ?? 0} aceptados`)
+    : el('small', { style: 'color: var(--text-dim);' }, 'sin envíos automáticos aún');
+
+  const statusLabel = el('span', { class: 'label-status' });
+  function refreshStatusLabel() {
+    statusLabel.textContent = enabledToggle.checked ? 'Enviando automáticamente' : 'Pausado';
+    statusLabel.style.color = enabledToggle.checked ? 'var(--ok)' : 'var(--text-dim)';
+  }
+  refreshStatusLabel();
+  enabledToggle.addEventListener('change', refreshStatusLabel);
+
+  const switchEl = el('label', { class: 'toggle-switch' },
+    enabledToggle, el('span', { class: 'track' }), el('span', { class: 'knob' }));
+  const toggleRow = el('div', { class: 'toggle-row' },
+    el('span', { class: 'label-main' }, 'Auto-envío'), switchEl, statusLabel,
+  );
+
+  const body = el('div', { class: 'card-body', style: 'display: none;' },
+    toggleRow,
+    el('div', { class: 'row', style: 'margin-bottom: 10px;' },
+      field('Intervalo (seg)', intervalInput),
+    ),
+    lastInfo,
+    chipsBox,
+  );
+
+  const chevron = el('span', { style: 'display: inline-block; transition: transform 0.15s; color: var(--text-dim); width: 14px;' }, '▸');
+  const header = el('div', {
+    class: 'card-header',
+    style: 'cursor: pointer; user-select: none;',
+    onclick: (ev) => {
+      if (ev.target.closest('button, input, select, label, a')) return;
+      const showing = body.style.display !== 'none';
+      body.style.display = showing ? 'none' : '';
+      chevron.style.transform = showing ? 'rotate(0deg)' : 'rotate(90deg)';
+    },
+  },
+    chevron,
+    el('span', { style: 'font-weight: 600; font-size: 0.95rem;' }, g.name || '(sin nombre)'),
+    el('span', { class: 'badge muted' }, `${g.vehicles?.length || 0} vehículos`),
+    schedBadge,
+    el('div', { class: 'spacer' }),
+    sendGroupBtn,
+  );
+
+  cardEl.appendChild(header);
+  cardEl.appendChild(body);
+  return cardEl;
+}
+
 async function loadFalabellaHistory() {
   const box = document.getElementById('falabellaHistoryBox');
   if (!box) return;
@@ -1462,6 +1842,8 @@ function buildEnviosView() {
     el('option', { value: '' }, 'Todos los servicios'),
     el('option', { value: 'Falabella' }, 'Falabella'),
     el('option', { value: 'Wise' }, 'Wise'),
+    el('option', { value: 'Drivin' }, 'Drivin'),
+    el('option', { value: 'Bermann' }, 'Bermann'),
   );
   const resultFilter = el('select', { style: 'min-width: 180px;' },
     el('option', { value: '' }, 'Todos los resultados'),
@@ -1510,9 +1892,11 @@ function buildEnviosView() {
 
 async function refreshEnvios() {
   if (!enviosState) return;
-  const [faH, wiH] = await Promise.all([
+  const [faH, wiH, drH, bermH] = await Promise.all([
     api('/api/falabella/history?limit=300').catch(() => ({ entries: [] })),
     api('/api/wise/history?limit=300').catch(() => ({ entries: [] })),
+    api('/api/drivin/history?limit=300').catch(() => ({ entries: [] })),
+    api('/api/bermann/history?limit=300').catch(() => ({ entries: [] })),
   ]);
   const merged = [];
   for (const e of faH.entries || []) {
@@ -1539,6 +1923,33 @@ async function refreshEnvios() {
       payload: e.payload, response: e.response, error: e.error, raw: e.raw,
       vehicleId: e.vehicleId, groupId: e.groupId, url: e.url,
       message: e.message, estados: e.estados,
+    });
+  }
+  for (const e of drH.entries || []) {
+    const p0 = e.payload?._json?.[0] || e.payload?.positions?.[0]; // compat con entries viejos
+    merged.push({
+      kind: 'drivin', service: 'Drivin',
+      ts: e.ts,
+      patente: p0?.vehicle_code || e.vehicleId,
+      // Drivin usa timestamp en SEGUNDOS — multiplicar por 1000 para Date
+      eventTs: p0?.timestamp ? new Date(Number(p0.timestamp) * 1000).toISOString() : null,
+      speed: p0?.speed != null ? Math.round(Number(p0.speed) * 3.6) : null, // m/s → km/h visual
+      status: e.status, ok: e.ok, accepted: Boolean(e.accepted),
+      payload: e.payload, response: e.response, error: e.error, raw: e.raw,
+      vehicleId: e.vehicleId, groupId: e.groupId, url: e.url,
+    });
+  }
+  for (const e of bermH.entries || []) {
+    const p = e.payload || {};
+    merged.push({
+      kind: 'bermann', service: 'Bermann',
+      ts: e.ts,
+      patente: p.patente || e.vehicleId,
+      eventTs: p.fecha,
+      speed: p.velocidad,
+      status: e.status, ok: e.ok, accepted: Boolean(e.accepted),
+      payload: e.payload, response: e.response, error: e.error, raw: e.raw,
+      vehicleId: e.vehicleId, groupId: e.groupId, url: e.url,
     });
   }
   merged.sort((a, b) => new Date(b.ts) - new Date(a.ts));
