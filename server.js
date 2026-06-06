@@ -734,7 +734,9 @@ function inferWiseEvent(pos) {
 // Construye una posición individual (item dentro del array `posicion`)
 function buildWisePosicionItem(obj, pos) {
   const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
-  const patente = String(plateRaw || pick(obj, ['id']) || '').replace(/[^A-Za-z0-9-]/g, '').toUpperCase();
+  // Wisetrack registra las patentes con guión (ej: "GRJB-61"). Normalizamos para
+  // insertarlo si fm-track la trae sin guión, evitando el Estado 4 ("móvil no existe").
+  const patente = plateWithHyphen(plateRaw || pick(obj, ['id']) || '');
   const lat = pick(pos, ['position.latitude']);
   const lng = pick(pos, ['position.longitude']);
   const direccion = clampInt(pick(pos, ['position.direction']), 0, 359, 0);
