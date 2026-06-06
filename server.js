@@ -759,14 +759,33 @@ const WISE_ESTADO_MAP = {
   5: 'Registro duplicado',
   6: 'Error interno',
 };
-function parseWiseEstados(body) {
+// El DetalleEjecucion trae la patente como primer dato del paréntesis:
+//   "OK. (WIS-212, 2017-03-18 16:20:00, 45)"  → patente = WIS-212
+// Aplica tanto a éxito como a error (el doc dice que el detalle incluye patente, fecha y evento).
+function extractWisePatente(detalle) {
+  if (!detalle || typeof detalle !== 'string') return null;
+  const m = detalle.match(/\(([^,)]+)/);
+  return m ? m[1].trim().toUpperCase() : null;
+}
+
+// Parsea la respuesta Wise a [{ estado, patente, detalle }] (uno por ResultadoTransaccion).
+function parseWiseResults(body) {
   if (!body || typeof body !== 'object') return [];
   const rop = body?.RespuestaServicioWeb?.RespuestaOperacion;
-  if (Array.isArray(rop)) {
-    return rop.map((o) => Number(o?.ResultadoTransaccion?.Estado)).filter(Number.isFinite);
-  }
-  const e = rop?.ResultadoTransaccion?.Estado;
-  return e != null ? [Number(e)] : [];
+  if (rop == null) return [];
+  const arr = Array.isArray(rop) ? rop : [rop];
+  return arr.map((o) => {
+    const rt = o?.ResultadoTransaccion || {};
+    const estado = Number(rt.Estado);
+    return {
+      estado: Number.isFinite(estado) ? estado : null,
+      patente: extractWisePatente(rt.DetalleEjecucion),
+      detalle: rt.DetalleEjecucion ?? null,
+    };
+  });
+}
+function parseWiseEstados(body) {
+  return parseWiseResults(body).map((r) => r.estado).filter((e) => e != null);
 }
 function wiseDetailFromEstados(estados) {
   if (!estados.length) return 'sin estado en respuesta';
@@ -789,13 +808,15 @@ async function sendOneToWise({ payload }) {
     });
     const text = await r.text();
     let body; try { body = JSON.parse(text); } catch { body = text; }
-    const estados = parseWiseEstados(body);
+    const wiseResults = parseWiseResults(body);
+    const estados = wiseResults.map((x) => x.estado).filter((e) => e != null);
     const accepted = estados.length > 0 && estados.every((e) => e === 1);
     return {
       ok: r.ok,
       status: r.status,
       accepted,
       estados,
+      results: wiseResults,
       message: wiseDetailFromEstados(estados),
       response: body,
       url: WISE_API_URL,
@@ -869,12 +890,20 @@ async function sendForVehiclesWise({ groupId, vehicleIds }) {
   // Un solo POST con todas las posiciones
   const payload = { posicion: items.map((x) => x.payloadItem) };
   const batchResp = await sendOneToWise({ payload });
+  const wiseResults = batchResp.results || [];
   const estados = batchResp.estados || [];
 
-  // Distribuir el estado a cada vehículo (Wise responde en el mismo orden enviado)
+  // Mapa patente → estado (según el doc, el DetalleEjecucion identifica la patente).
+  const estadoByPatente = new Map();
+  for (const r of wiseResults) {
+    if (r.patente != null && r.estado != null) estadoByPatente.set(r.patente, r.estado);
+  }
+
+  // Distribuir el estado a cada vehículo: primero por patente; si no calza, fallback por orden.
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
-    const estado = estados[i];
+    const itPat = String(it.payloadItem?.patente || '').toUpperCase();
+    const estado = estadoByPatente.has(itPat) ? estadoByPatente.get(itPat) : estados[i];
     const accepted = estado === 1;
     if (estado === 4) {
       // "No existe el móvil" → marcar como bloqueado y no reenviar más
