@@ -711,18 +711,10 @@ function toWiseCoord(n) {
 function toWiseDatetime(ts) {
   const d = new Date(ts || Date.now());
   if (isNaN(d.getTime())) return '';
-  // Wisetrack en Chile: enviar la hora en la zona horaria local (configurable via WISE_TIMEZONE).
-  // Formato: yyyy-MM-dd HH:mm:ss (sin marcador de zona, como pide la doc).
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: WISE_TIMEZONE,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false,
-  }).formatToParts(d);
-  const get = (t) => parts.find((p) => p.type === t)?.value || '00';
-  // Algunos locales devuelven "24" para medianoche; normalizar a "00".
-  const hh = get('hour') === '24' ? '00' : get('hour');
-  return `${get('year')}-${get('month')}-${get('day')} ${hh}:${get('minute')}:${get('second')}`;
+  // Spec Wisetrack v1.1: la fecha del GPS debe ir en UTC, formato yyyy-MM-dd HH:mm:ss.
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+         `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 // Evento según tabla Wise:
 //   45 = posición online con ignición + conectado a la red
@@ -938,7 +930,8 @@ app.put('/api/wise/groups/:id', async (req, res) => {
   const id = String(req.params.id);
   const prev = wiseGroups[id] || defaultWiseGroupConfig();
   const next = { ...prev };
-  if (req.body?.intervalSec != null) next.intervalSec = Math.max(5, Number(req.body.intervalSec) || 20);
+  // Spec Wisetrack: 1 llamada cada >=20s, máx 3/min. Forzamos piso de 20s (default 30s).
+  if (req.body?.intervalSec != null) next.intervalSec = Math.max(20, Number(req.body.intervalSec) || 30);
   if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
   wiseGroups[id] = next;
   await saveWiseGroups();
