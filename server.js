@@ -917,7 +917,9 @@ async function sendForVehiclesWise({ groupId, vehicleIds }) {
       wiseBlocked.add(String(it.vehicleId));
       await db.addBlocked('wise', it.vehicleId, 'no existe en Wisetrack (estado 4)');
     }
-    if (accepted) {
+    // Estado 1 (aceptado) o 5 (duplicado: Wisetrack YA tiene esta posición) → marcar
+    // como enviada y no reinyectarla hasta que el vehículo reporte una nueva.
+    if (accepted || estado === 5) {
       wiseLastSentDatetime.set(String(it.vehicleId), it.datetime);
       await db.saveLastSent('wise', it.vehicleId, it.datetime);
     }
