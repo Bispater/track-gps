@@ -759,9 +759,9 @@ const WISE_ESTADO_MAP = {
   5: 'Registro duplicado',
   6: 'Error interno',
 };
-// El DetalleEjecucion trae la patente como primer dato del paréntesis:
-//   "OK. (WIS-212, 2017-03-18 16:20:00, 45)"  → patente = WIS-212
-// Aplica tanto a éxito como a error (el doc dice que el detalle incluye patente, fecha y evento).
+// El detalle trae la patente como primer dato del paréntesis:
+//   "Registro duplicado. (FCCS23, 2026-06-07 08:09:58, 46)"  → patente = FCCS23
+// OJO: la API real responde "DetalleOperacion" (el doc lo llamaba "DetalleEjecucion").
 function extractWisePatente(detalle) {
   if (!detalle || typeof detalle !== 'string') return null;
   const m = detalle.match(/\(([^,)]+)/);
@@ -777,10 +777,11 @@ function parseWiseResults(body) {
   return arr.map((o) => {
     const rt = o?.ResultadoTransaccion || {};
     const estado = Number(rt.Estado);
+    const detalle = rt.DetalleOperacion ?? rt.DetalleEjecucion ?? null;
     return {
       estado: Number.isFinite(estado) ? estado : null,
-      patente: extractWisePatente(rt.DetalleEjecucion),
-      detalle: rt.DetalleEjecucion ?? null,
+      patente: extractWisePatente(detalle),
+      detalle,
     };
   });
 }
@@ -834,8 +835,14 @@ async function loadWiseBlocked() {
 }
 await loadWiseBlocked();
 
-// En memoria: último datetime enviado por vehículo (para dedupe — no re-inyectar la misma posición)
+// Dedupe: último datetime enviado y aceptado por vehículo (no re-inyectar la misma posición).
+// Se carga desde Postgres al arranque para sobrevivir a reinicios (spec: no reinyectar exitosas).
 const wiseLastSentDatetime = new Map();
+async function loadWiseLastSent() {
+  const m = await db.loadLastSent('wise');
+  for (const [k, v] of m) wiseLastSentDatetime.set(k, v);
+}
+await loadWiseLastSent();
 
 const WISE_MAX_PER_REQUEST = 300;
 
@@ -912,6 +919,7 @@ async function sendForVehiclesWise({ groupId, vehicleIds }) {
     }
     if (accepted) {
       wiseLastSentDatetime.set(String(it.vehicleId), it.datetime);
+      await db.saveLastSent('wise', it.vehicleId, it.datetime);
     }
     const entry = {
       vehicleId: it.vehicleId,

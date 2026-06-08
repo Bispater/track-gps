@@ -68,6 +68,16 @@ CREATE TABLE IF NOT EXISTS blocked_vehicle (
   ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (client, vehicle_id)
 );
+
+-- Último datetime de posición enviado y ACEPTADO por vehículo, para no reinyectar
+-- la misma posición (sobrevive a reinicios). Lo exige el spec de Wisetrack.
+CREATE TABLE IF NOT EXISTS last_sent (
+  client     TEXT        NOT NULL,
+  vehicle_id TEXT        NOT NULL,
+  datetime   TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (client, vehicle_id)
+);
 `;
 
 // Espera a que Postgres esté disponible (en Docker el backend arranca antes que la DB
@@ -204,6 +214,22 @@ export async function removeBlocked(client, vehicleId) {
 }
 export async function clearBlocked(client) {
   await pool.query('DELETE FROM blocked_vehicle WHERE client = $1', [client]);
+}
+
+// ---------- last_sent (dedupe persistente) ----------
+export async function loadLastSent(client) {
+  const { rows } = await pool.query('SELECT vehicle_id, datetime FROM last_sent WHERE client = $1', [client]);
+  const map = new Map();
+  for (const r of rows) map.set(r.vehicle_id, r.datetime);
+  return map;
+}
+export async function saveLastSent(client, vehicleId, datetime) {
+  await pool.query(
+    `INSERT INTO last_sent (client, vehicle_id, datetime, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (client, vehicle_id) DO UPDATE SET datetime = EXCLUDED.datetime, updated_at = now()`,
+    [client, String(vehicleId), datetime ?? null]
+  );
 }
 
 // ---------- retención ----------
