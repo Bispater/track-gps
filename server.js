@@ -34,6 +34,11 @@ const {
   BERMANN_USERNAME = '',
   BERMANN_PASSWORD = '',
   BERMANN_GROUPS = '',
+  DS_API_URL = 'http://18.232.149.50/api/v1/postDataGPS',
+  DS_EMPRESA = '',
+  DS_RUT = '',
+  DS_GROUPS = '',
+  DS_TIMEZONE = 'America/Santiago',
 } = process.env;
 
 function makeGroupSet(raw) {
@@ -44,6 +49,7 @@ const FALABELLA_GROUPS_SET = makeGroupSet(FALABELLA_GROUPS || ALLOWED_GROUPS);
 const WISE_GROUPS_SET = makeGroupSet(WISE_GROUPS);
 const DRIVIN_GROUPS_SET = makeGroupSet(DRIVIN_GROUPS);
 const BERMANN_GROUPS_SET = makeGroupSet(BERMANN_GROUPS);
+const DS_GROUPS_SET = makeGroupSet(DS_GROUPS);
 
 function isInSet(g, set) {
   if (set.size === 0) return true;
@@ -54,6 +60,7 @@ const isFalabellaGroupAllowed = (g) => isInSet(g, FALABELLA_GROUPS_SET);
 const isWiseGroupAllowed = (g) => isInSet(g, WISE_GROUPS_SET);
 const isDrivinGroupAllowed = (g) => isInSet(g, DRIVIN_GROUPS_SET);
 const isBermannGroupAllowed = (g) => isInSet(g, BERMANN_GROUPS_SET);
+const isDsGroupAllowed = (g) => isInSet(g, DS_GROUPS_SET);
 
 // Limpia llaves/espacios que muchas veces se pegan con el placeholder de la doc
 const cleanKey = (s) => (s || '').trim().replace(/^[{<\[]+|[}>\]]+$/g, '');
@@ -1108,17 +1115,19 @@ async function saveDrivinGroups() {
 }
 await loadDrivinGroups();
 
-// Adapter Drivin: payload con root "_json", "lng" minúscula, timestamp en segundos, speed en m/s.
+// Adapter Drivin: payload con root "positions", "lng" minúscula, timestamp en milisegundos, speed en m/s.
 function buildDrivinPositionItem(obj, pos) {
-  const deviceNumber = String(pick(obj, ['id', 'object_id']) || '').slice(0, 255);
+  // Drivin (según correo del cliente): device_number y vehicle_code = PATENTE SIN ESPACIOS (ej: HCKP21)
   const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
-  const vehicleCode = String(plateRaw || '').slice(0, 255);
+  const plate = String(plateRaw || '').replace(/\s+/g, '').toUpperCase().slice(0, 255);
+  const deviceNumber = plate;
+  const vehicleCode = plate;
   const lat = Number(pick(pos, ['position.latitude']));
   const lng = Number(pick(pos, ['position.longitude']));
   const dtRaw = pick(pos, ['datetime']);
   const tsMs = dtRaw ? new Date(dtRaw).getTime() : Date.now();
-  // Drivin espera timestamp en SEGUNDOS, no milisegundos
-  const timestamp = Math.floor((Number.isFinite(tsMs) ? tsMs : Date.now()) / 1000);
+  // Drivin espera timestamp en MILISEGUNDOS (ej. de la doc: 1519135237474)
+  const timestamp = Number.isFinite(tsMs) ? tsMs : Date.now();
   const speedKmh = Number(pick(pos, ['position.speed']) ?? 0);
   const heading = Number(pick(pos, ['position.direction']) ?? 0);
 
@@ -1144,7 +1153,7 @@ function buildDrivinPositionItem(obj, pos) {
   return item;
 }
 function buildDrivinPayload(obj, pos) {
-  return { _json: [buildDrivinPositionItem(obj, pos)] };
+  return { positions: [buildDrivinPositionItem(obj, pos)] };
 }
 
 async function sendOneToDrivin({ payload }) {
@@ -1201,7 +1210,7 @@ async function sendForVehiclesDrivin({ groupId, vehicleIds }) {
   }
   if (!items.length) return results;
 
-  const payload = { _json: items.map((x) => x.payloadItem) };
+  const payload = { positions: items.map((x) => x.payloadItem) };
   const batchResp = await sendOneToDrivin({ payload });
 
   // Drivin no devuelve resultado por posición; el accepted del batch se aplica a todas.
@@ -1212,7 +1221,7 @@ async function sendForVehiclesDrivin({ groupId, vehicleIds }) {
       status: batchResp.status,
       accepted: batchResp.accepted,
       response: batchResp.response,
-      payload: { _json: [it.payloadItem] },
+      payload: { positions: [it.payloadItem] },
       raw: it.raw,
       url: batchResp.url,
       groupId,
@@ -1608,6 +1617,224 @@ setInterval(async () => {
   }
 }, BERMANN_TICK_MS);
 
+// ===================== DS =====================
+const appendDsHistory = (e) => db.appendHistory('ds', e);
+
+let dsGroups = {};
+function defaultDsGroupConfig() {
+  // DS exige envío cada 60s mínimo según su doc.
+  return { intervalSec: 60, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
+}
+async function loadDsGroups() {
+  dsGroups = await db.loadGroupConfigs('ds');
+}
+async function saveDsGroups() {
+  await db.saveGroupConfigs('ds', dsGroups);
+}
+await loadDsGroups();
+
+// fechahora en hora local Chile, formato "yyyy-MM-dd HH:mm:ss" (sin offset)
+function toDsDatetime(ts) {
+  const d = new Date(ts || Date.now());
+  if (isNaN(d.getTime())) return '';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: DS_TIMEZONE, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t)?.value || '00';
+  const hh = get('hour') === '24' ? '00' : get('hour');
+  return `${get('year')}-${get('month')}-${get('day')} ${hh}:${get('minute')}:${get('second')}`;
+}
+
+function buildDsPayload(obj, pos) {
+  const idgps = String(pick(obj, ['imei', 'identifier']) || '').slice(0, 15);
+  const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
+  // patente SIN guion ni caracteres raros (la doc dice "sin guion")
+  const patente = String(plateRaw || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  const lat = pick(pos, ['position.latitude']);
+  const lon = pick(pos, ['position.longitude']);
+  const sentido = clampInt(pick(pos, ['position.direction']), 0, 360, 0);
+  const velocidad = clampInt(pick(pos, ['position.speed']), 0, 1000, 0);
+  const motor = pick(pos, ['ignition_status']) === 'ON' ? 1 : 0;
+  // RUT empresa transportista SIN puntos ni guion
+  const rut = String(DS_RUT || '').replace(/[.\-\s]/g, '');
+  return {
+    empresa: String(DS_EMPRESA || ''),
+    rut,
+    fechahora: toDsDatetime(pick(pos, ['datetime'])),
+    idgps,
+    patente,
+    latitud: String(lat != null ? Number(lat) : ''),
+    longitud: String(lon != null ? Number(lon) : ''),
+    sentido,
+    velocidad,
+    motor,
+  };
+}
+
+async function sendOneToDs({ payload }) {
+  if (!DS_EMPRESA || !DS_RUT) {
+    return { ok: false, status: 0, accepted: false, response: { error: 'DS_EMPRESA y DS_RUT no configurados en .env' }, url: DS_API_URL };
+  }
+  try {
+    const r = await fetch(DS_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    // DS devuelve HTTP 200 con { estado: "OK"|"Error", mensaje: "..." }
+    const accepted = r.ok && body && typeof body === 'object' && String(body.estado).toUpperCase() === 'OK';
+    const message = (body && typeof body === 'object' && body.mensaje) ? String(body.mensaje) : '';
+    return { ok: r.ok, status: r.status, accepted, message, response: body, url: DS_API_URL };
+  } catch (err) {
+    return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url: DS_API_URL };
+  }
+}
+
+async function sendForVehiclesDs({ groupId, vehicleIds }) {
+  let ids = vehicleIds;
+  if (groupId && !ids) {
+    await ensureGroupsCache();
+    const fmGroup = groupsCache.groups.find((g) => g.id === groupId);
+    if (!fmGroup) throw new Error('grupo no existe en fm-track: ' + groupId);
+    ids = fmGroup.vehicles || [];
+  }
+  if (!ids || !ids.length) return [];
+  const results = [];
+  // DS recibe UN objeto por request (no array), iteramos
+  for (const vid of ids) {
+    try {
+      const { obj, pos } = await getPositionsForId(vid);
+      if (!pos) {
+        const entry = { vehicleId: vid, ok: false, accepted: false, error: 'sin posición en últimos 7 días', groupId };
+        await appendDsHistory(entry);
+        results.push(entry);
+        continue;
+      }
+      const payload = buildDsPayload(obj, pos);
+      const r = await sendOneToDs({ payload });
+      const entry = { vehicleId: vid, ...r, payload, raw: pos, groupId };
+      await appendDsHistory(entry);
+      results.push(entry);
+    } catch (err) {
+      const entry = { vehicleId: vid, ok: false, accepted: false, error: String(err), groupId };
+      await appendDsHistory(entry);
+      results.push(entry);
+    }
+  }
+  return results;
+}
+
+app.get('/api/ds/config', (_req, res) => {
+  res.json({
+    url: DS_API_URL,
+    credentialsConfigured: Boolean(DS_EMPRESA && DS_RUT),
+    empresa: DS_EMPRESA || null,
+    rut: DS_RUT ? DS_RUT.replace(/[.\-\s]/g, '') : null,
+  });
+});
+
+app.get('/api/ds/groups', async (_req, res) => {
+  try {
+    await ensureGroupsCache();
+    const groups = {};
+    for (const g of groupsCache.groups) {
+      if (!isDsGroupAllowed(g)) continue;
+      groups[g.id] = {
+        id: g.id, name: g.name,
+        vehicles: g.vehicles || [],
+        ...defaultDsGroupConfig(),
+        ...(dsGroups[g.id] || {}),
+      };
+    }
+    res.json({ groups });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.put('/api/ds/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  const prev = dsGroups[id] || defaultDsGroupConfig();
+  const next = { ...prev };
+  // DS pide cada 60s mínimo según política
+  if (req.body?.intervalSec != null) next.intervalSec = Math.max(60, Number(req.body.intervalSec) || 60);
+  if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
+  dsGroups[id] = next;
+  await saveDsGroups();
+  res.json(next);
+});
+
+app.delete('/api/ds/groups/:id', async (req, res) => {
+  delete dsGroups[String(req.params.id)];
+  await saveDsGroups();
+  res.json({ ok: true });
+});
+
+app.post('/api/ds/preview', async (req, res) => {
+  try {
+    const { vehicleId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ ok: false, error: 'falta vehicleId' });
+    const { obj, pos } = await getPositionsForId(vehicleId);
+    if (!pos) return res.json({ ok: false, error: 'sin última posición' });
+    res.json({ ok: true, payload: buildDsPayload(obj, pos), raw: { object: obj, position: pos } });
+  } catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+
+app.post('/api/ds/send-one', async (req, res) => {
+  try {
+    const { vehicleId, groupId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ error: 'falta vehicleId' });
+    const [r] = await sendForVehiclesDs({ vehicleIds: [vehicleId], groupId });
+    res.json(r);
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.post('/api/ds/groups/:id/send', async (req, res) => {
+  try {
+    const results = await sendForVehiclesDs({ groupId: req.params.id });
+    res.json({ results });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.get('/api/ds/history', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const groupId = req.query.groupId ? String(req.query.groupId) : null;
+  const entries = await db.readHistory('ds', { limit, groupId });
+  res.json({ entries });
+});
+
+// Scheduler DS — chequea cada 5s, dispara cuando toca (mínimo 60s entre envíos)
+const DS_TICK_MS = 5000;
+setInterval(async () => {
+  try { await ensureGroupsCache(); } catch { return; }
+  const now = Date.now();
+  for (const fmGroup of groupsCache.groups) {
+    if (!isDsGroupAllowed(fmGroup)) continue;
+    const config = dsGroups[fmGroup.id];
+    if (!config?.enabled) continue;
+    if (!fmGroup.vehicles?.length) continue;
+    const last = config.lastRunAt ? new Date(config.lastRunAt).getTime() : 0;
+    if (now - last < (config.intervalSec || 60) * 1000) continue;
+    config.lastRunAt = new Date().toISOString();
+    try {
+      const results = await sendForVehiclesDs({ groupId: fmGroup.id });
+      const accepted = results.filter((x) => x.accepted).length;
+      const okCount = results.filter((x) => x.ok).length;
+      const failed = results.filter((x) => !x.ok).length;
+      config.lastSummary = { total: results.length, accepted, ok: okCount, failed };
+      config.lastStatus = failed === 0 ? (accepted === results.length ? 'ok' : 'partial') : 'err';
+      await saveDsGroups();
+    } catch (err) {
+      config.lastStatus = 'err';
+      config.lastSummary = { error: String(err) };
+      await appendLog({ kind: 'ds_scheduler_error', groupId: fmGroup.id, error: String(err) });
+      await saveDsGroups();
+    }
+  }
+}, DS_TICK_MS);
+
 app.listen(PORT, () => {
   console.log(`track-service · http://localhost:${PORT}`);
   if (!FM_TRACK_API_KEY) console.warn('  ⚠  FM_TRACK_API_KEY no configurada');
@@ -1617,6 +1844,7 @@ app.listen(PORT, () => {
   if (!WISE_API_TOKEN) console.warn('  ⚠  WISE_API_TOKEN no configurado');
   if (!DRIVIN_API_KEY) console.warn('  ⚠  DRIVIN_API_KEY no configurado');
   if (!BERMANN_ID_CLIENTE_EXTERNO || !BERMANN_USERNAME || !BERMANN_PASSWORD) console.warn('  ⚠  Credenciales Bermann no configuradas');
+  if (!DS_EMPRESA || !DS_RUT) console.warn('  ⚠  Credenciales DS no configuradas (empresa + rut transportista)');
   if (AUTH_ENABLED) {
     console.log(`  auth · ACTIVADA · ${AUTH_USERS.size} cuenta(s)`);
     if (!process.env.AUTH_SECRET) console.warn('  ⚠  AUTH_SECRET no definido — las sesiones se invalidan en cada reinicio. Define AUTH_SECRET en .env.');
@@ -1627,8 +1855,10 @@ app.listen(PORT, () => {
   const activeWise = Object.values(wiseGroups).filter((g) => g.enabled).length;
   const activeDrivin = Object.values(drivinGroups).filter((g) => g.enabled).length;
   const activeBermann = Object.values(bermannGroups).filter((g) => g.enabled).length;
+  const activeDs = Object.values(dsGroups).filter((g) => g.enabled).length;
   console.log(`  scheduler Falabella · ${activeFal}/${Object.keys(falabellaGroups).length} grupos activos`);
   console.log(`  scheduler Wise · ${activeWise}/${Object.keys(wiseGroups).length} grupos activos`);
   console.log(`  scheduler Drivin · ${activeDrivin}/${Object.keys(drivinGroups).length} grupos activos`);
   console.log(`  scheduler Bermann · ${activeBermann}/${Object.keys(bermannGroups).length} grupos activos`);
+  console.log(`  scheduler DS · ${activeDs}/${Object.keys(dsGroups).length} grupos activos`);
 });
