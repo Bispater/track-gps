@@ -1801,7 +1801,7 @@ app.post('/api/ds/groups/:id/send', async (req, res) => {
 app.get('/api/ds/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   const groupId = req.query.groupId ? String(req.query.groupId) : null;
-  const entries = await db.readHistory('ds', { limit, groupId });
+  const entries = await db.getHistory('ds', { limit, groupId });
   res.json({ entries });
 });
 
