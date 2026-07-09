@@ -1403,7 +1403,8 @@ function toBermannDatetime(ts) {
 function buildBermannPayload(obj, pos) {
   const imei = String(pick(obj, ['imei', 'identifier']) || '');
   const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
-  const patente = plateWithHyphen(plateRaw);
+  // Bermann registra las patentes SIN guión (ej: "PJKY92"), a diferencia de Wise.
+  const patente = String(plateRaw || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
   const lat = pick(pos, ['position.latitude']);
   const lon = pick(pos, ['position.longitude']);
   const dt = pick(pos, ['datetime']);
