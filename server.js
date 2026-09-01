@@ -166,7 +166,10 @@ async function ensureGroupsCacheForKey(apiKey) {
   if (Date.now() - cache.fetchedAt < GROUPS_TTL_MS) return;
   try {
     const r = await callFmTrack('/object-groups', apiKey);
-    if (!r.ok) return;
+    if (!r.ok) {
+      console.warn(`[fm-track] error al listar grupos: HTTP ${r.status}`);
+      return;
+    }
     const items = toArray(r.data?.items ?? r.data);
     cache.groups = items.map((g) => ({
       id: String(g.id), name: String(g.name || ''),
@@ -175,7 +178,15 @@ async function ensureGroupsCacheForKey(apiKey) {
     // Index para resolver tenant por groupId
     for (const g of cache.groups) groupKeyIndex.set(g.id, apiKey);
     cache.fetchedAt = Date.now();
-  } catch {}
+    // Log de diagnóstico: solo cuando la lista cambia (nombre exacto = lo que va en *_GROUPS)
+    const names = cache.groups.map((g) => `"${g.name}" (id ${g.id}, ${g.vehicles.length} veh)`).join(', ') || '(ninguno)';
+    if (names !== cache.lastLoggedNames) {
+      cache.lastLoggedNames = names;
+      console.log(`[fm-track] grupos sincronizados: ${names}`);
+    }
+  } catch (err) {
+    console.warn('[fm-track] error al listar grupos:', String(err));
+  }
 }
 async function ensureGroupsCache() {
   await Promise.all(FM_TRACK_API_KEYS.map((k) => ensureGroupsCacheForKey(k)));
