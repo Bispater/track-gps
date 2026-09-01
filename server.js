@@ -740,7 +740,7 @@ function buildWisePosicionItem(obj, pos) {
   const lng = pick(pos, ['position.longitude']);
   const direccion = clampInt(pick(pos, ['position.direction']), 0, 359, 0);
   const velocidad = clampInt(pick(pos, ['position.speed']), 0, 999, 0);
-  return {
+  const item = {
     patente,
     fecha_hora: toWiseDatetime(pick(pos, ['datetime'])),
     latitud: toWiseCoord(lat),
@@ -751,6 +751,10 @@ function buildWisePosicionItem(obj, pos) {
     estado_ignicion: pick(pos, ['ignition_status']) === 'ON' ? '1' : '0',
     numero_evento: inferWiseEvent(pos),
   };
+  // Sensor de temperatura: solo se incluye si fm-track lo trae con valor (null se omite).
+  const temp = pick(pos, ['device_inputs.temperature_sensor_0']);
+  if (temp != null && Number.isFinite(Number(temp))) item.sensor_a1 = String(Number(temp));
+  return item;
 }
 // Backwards compat: single-position payload (preview)
 function buildWisePayload(obj, pos) {
