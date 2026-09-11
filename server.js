@@ -39,6 +39,10 @@ const {
   DS_RUT = '',
   DS_GROUPS = '',
   DS_TIMEZONE = 'America/Santiago',
+  QANALYTICS_API_URL = 'https://ww3.qanalytics.cl/Api_InsertaPosicion_General_test',
+  QANALYTICS_USERNAME = '',
+  QANALYTICS_PASSWORD = '',
+  QANALYTICS_GROUPS = '',
 } = process.env;
 
 function makeGroupSet(raw) {
@@ -50,6 +54,7 @@ const WISE_GROUPS_SET = makeGroupSet(WISE_GROUPS);
 const DRIVIN_GROUPS_SET = makeGroupSet(DRIVIN_GROUPS);
 const BERMANN_GROUPS_SET = makeGroupSet(BERMANN_GROUPS);
 const DS_GROUPS_SET = makeGroupSet(DS_GROUPS);
+const QANALYTICS_GROUPS_SET = makeGroupSet(QANALYTICS_GROUPS);
 
 function isInSet(g, set) {
   if (set.size === 0) return true;
@@ -61,6 +66,7 @@ const isWiseGroupAllowed = (g) => isInSet(g, WISE_GROUPS_SET);
 const isDrivinGroupAllowed = (g) => isInSet(g, DRIVIN_GROUPS_SET);
 const isBermannGroupAllowed = (g) => isInSet(g, BERMANN_GROUPS_SET);
 const isDsGroupAllowed = (g) => isInSet(g, DS_GROUPS_SET);
+const isQanalyticsGroupAllowed = (g) => isInSet(g, QANALYTICS_GROUPS_SET);
 
 // Limpia llaves/espacios que muchas veces se pegan con el placeholder de la doc
 const cleanKey = (s) => (s || '').trim().replace(/^[{<\[]+|[}>\]]+$/g, '');
@@ -1851,6 +1857,262 @@ setInterval(async () => {
   }
 }, DS_TICK_MS);
 
+// ===================== Qanalytics (Q Integración) =====================
+const appendQanalyticsHistory = (e) => db.appendHistory('qanalytics', e);
+
+let qanalyticsGroups = {};
+function defaultQanalyticsGroupConfig() {
+  // Qanalytics exige >=20s entre llamadas; cada patente reporta máx cada 1 min con motor encendido.
+  return { intervalSec: 60, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
+}
+async function loadQanalyticsGroups() {
+  qanalyticsGroups = await db.loadGroupConfigs('qanalytics');
+}
+async function saveQanalyticsGroups() {
+  await db.saveGroupConfigs('qanalytics', qanalyticsGroups);
+}
+await loadQanalyticsGroups();
+
+// Spec Qanalytics: fechas DATETIME en GMT 0, formato "yyyy-MM-ddTHH:mm:ss"
+function toQanalyticsDatetime(ts) {
+  const d = new Date(ts || Date.now());
+  if (isNaN(d.getTime())) return '';
+  return d.toISOString().slice(0, 19);
+}
+
+// Token: POST /Genera_Token con Basic Auth → accessToken Bearer, dura 3h.
+// Cache en memoria con margen de 10 min; ante 401 se regenera y reintenta una vez.
+let qanalyticsToken = { token: null, expiresAt: 0 };
+const QANALYTICS_TOKEN_TTL_MS = (3 * 60 - 10) * 60 * 1000;
+async function getQanalyticsToken(force = false) {
+  if (!force && qanalyticsToken.token && Date.now() < qanalyticsToken.expiresAt) return qanalyticsToken.token;
+  const base = QANALYTICS_API_URL.replace(/\/+$/, '');
+  const basic = Buffer.from(`${QANALYTICS_USERNAME}:${QANALYTICS_PASSWORD}`).toString('base64');
+  const r = await fetch(`${base}/Genera_Token/`, {
+    method: 'POST',
+    headers: { Accept: 'application/json', Authorization: `Basic ${basic}` },
+  });
+  const text = await r.text();
+  let body; try { body = JSON.parse(text); } catch { body = text; }
+  if (!r.ok || !body?.accessToken) {
+    const detail = typeof body === 'string' ? body.slice(0, 200) : JSON.stringify(body);
+    throw new Error(`Genera_Token HTTP ${r.status}: ${detail}`);
+  }
+  qanalyticsToken = { token: body.accessToken, expiresAt: Date.now() + QANALYTICS_TOKEN_TTL_MS };
+  return qanalyticsToken.token;
+}
+
+function buildQanalyticsItem(obj, pos) {
+  const plateRaw = pick(obj, ['vehicle_params.plate_number', 'plate', 'license_plate']) || pick(obj, ['name']);
+  // PLACA sin guion según spec
+  const placa = String(plateRaw || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  const codVeh = String(pick(obj, ['imei', 'identifier']) || pick(obj, ['id']) || placa).slice(0, 50);
+  const lat = pick(pos, ['position.latitude']);
+  const lon = pick(pos, ['position.longitude']);
+  const hdopRaw = Number(pick(pos, ['device_inputs.hdop']));
+  const item = {
+    COD_VEH: codVeh,
+    PLACA: placa,
+    LAT: lat != null ? Number(lat) : 0,
+    LON: lon != null ? Number(lon) : 0,
+    FH_SVR_GPS: toQanalyticsDatetime(Date.now()),
+    FH_RPT_GPS: toQanalyticsDatetime(pick(pos, ['datetime'])),
+    VEL: clampInt(pick(pos, ['position.speed']), 0, 1000, 0),
+    SENT: clampInt(pick(pos, ['position.direction']), 0, 360, 0),
+    CANT_SAT: clampInt(pick(pos, ['position.satellites_count']), 0, 100, 0),
+    HDOP: Number.isFinite(hdopRaw) ? Math.min(Math.max(hdopRaw, 0), 100) : 0,
+    IGN: pick(pos, ['ignition_status']) === 'ON' ? 1 : 0,
+  };
+  // Opcionales: solo se agregan si fm-track trae el dato (si no, Qanalytics usa su default)
+  const alt = Number(pick(pos, ['position.altitude']));
+  if (Number.isFinite(alt)) item.ALT = Math.min(Math.max(alt, -2000), 9999);
+  const mv = Number(pick(pos, ['device_inputs.power_supply_voltage']));
+  if (Number.isFinite(mv) && mv > 0) item.VOLT_VEH = Math.min(Math.round(mv / 10) / 100, 100);
+  const odom = Number(pick(pos, ['calculated_inputs.mileage']));
+  if (Number.isFinite(odom) && odom > 0) item.ODOM = Math.round(odom);
+  for (let i = 0; i < 4; i++) {
+    const t = Number(pick(pos, [`device_inputs.temperature_sensor_${i}`]));
+    if (Number.isFinite(t) && t >= -100 && t <= 100) item[`TEMP${i + 1}`] = t;
+  }
+  return item;
+}
+
+// Un solo POST con el array completo de posiciones (la doc recomienda batchear)
+async function sendBatchToQanalytics(items) {
+  const base = QANALYTICS_API_URL.replace(/\/+$/, '');
+  const url = `${base}/inserta_posiciones/`;
+  if (!QANALYTICS_USERNAME || !QANALYTICS_PASSWORD) {
+    return { ok: false, status: 0, accepted: false, response: { error: 'QANALYTICS_USERNAME y QANALYTICS_PASSWORD no configurados en .env' }, url };
+  }
+  try {
+    const doPost = async (token) => fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(items),
+    });
+    let r = await doPost(await getQanalyticsToken());
+    if (r.status === 401) r = await doPost(await getQanalyticsToken(true));
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    const message = (body && typeof body === 'object' && body.message) ? String(body.message) : '';
+    return { ok: r.ok, status: r.status, accepted: r.ok, message, response: body, url };
+  } catch (err) {
+    return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url };
+  }
+}
+
+async function sendForVehiclesQanalytics({ groupId, vehicleIds }) {
+  let ids = vehicleIds;
+  if (groupId && !ids) {
+    await ensureGroupsCache();
+    const fmGroup = groupsCache.groups.find((g) => g.id === groupId);
+    if (!fmGroup) throw new Error('grupo no existe en fm-track: ' + groupId);
+    ids = fmGroup.vehicles || [];
+  }
+  if (!ids || !ids.length) return [];
+  const items = []; // { vehicleId, item, raw }
+  const results = [];
+  for (const vid of ids) {
+    try {
+      const { obj, pos } = await getPositionsForId(vid);
+      if (!pos) {
+        const entry = { vehicleId: vid, ok: false, accepted: false, error: 'sin posición en últimos 7 días', groupId };
+        await appendQanalyticsHistory(entry);
+        results.push(entry);
+        continue;
+      }
+      items.push({ vehicleId: vid, item: buildQanalyticsItem(obj, pos), raw: pos });
+    } catch (err) {
+      const entry = { vehicleId: vid, ok: false, accepted: false, error: String(err), groupId };
+      await appendQanalyticsHistory(entry);
+      results.push(entry);
+    }
+  }
+  if (!items.length) return results;
+  const batchResp = await sendBatchToQanalytics(items.map((x) => x.item));
+  for (const it of items) {
+    const entry = {
+      vehicleId: it.vehicleId,
+      ok: batchResp.ok, status: batchResp.status, accepted: batchResp.accepted,
+      message: batchResp.message, response: batchResp.response, url: batchResp.url,
+      payload: it.item, raw: it.raw, groupId,
+    };
+    await appendQanalyticsHistory(entry);
+    results.push(entry);
+  }
+  return results;
+}
+
+app.get('/api/qanalytics/config', (_req, res) => {
+  res.json({
+    url: QANALYTICS_API_URL,
+    credentialsConfigured: Boolean(QANALYTICS_USERNAME && QANALYTICS_PASSWORD),
+    username: QANALYTICS_USERNAME || null,
+  });
+});
+
+app.get('/api/qanalytics/groups', async (_req, res) => {
+  try {
+    await ensureGroupsCache();
+    const groups = {};
+    for (const g of groupsCache.groups) {
+      if (!isQanalyticsGroupAllowed(g)) continue;
+      groups[g.id] = {
+        id: g.id, name: g.name,
+        vehicles: g.vehicles || [],
+        ...defaultQanalyticsGroupConfig(),
+        ...(qanalyticsGroups[g.id] || {}),
+      };
+    }
+    res.json({ groups });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.put('/api/qanalytics/groups/:id', async (req, res) => {
+  const id = String(req.params.id);
+  const prev = qanalyticsGroups[id] || defaultQanalyticsGroupConfig();
+  const next = { ...prev };
+  // Qanalytics exige mínimo 20s entre llamadas al servicio
+  if (req.body?.intervalSec != null) next.intervalSec = Math.max(20, Number(req.body.intervalSec) || 60);
+  if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
+  qanalyticsGroups[id] = next;
+  await saveQanalyticsGroups();
+  res.json(next);
+});
+
+app.delete('/api/qanalytics/groups/:id', async (req, res) => {
+  delete qanalyticsGroups[String(req.params.id)];
+  await saveQanalyticsGroups();
+  res.json({ ok: true });
+});
+
+app.post('/api/qanalytics/preview', async (req, res) => {
+  try {
+    const { vehicleId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ ok: false, error: 'falta vehicleId' });
+    const { obj, pos } = await getPositionsForId(vehicleId);
+    if (!pos) return res.json({ ok: false, error: 'sin última posición' });
+    res.json({ ok: true, payload: [buildQanalyticsItem(obj, pos)], raw: { object: obj, position: pos } });
+  } catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+
+app.post('/api/qanalytics/send-one', async (req, res) => {
+  try {
+    const { vehicleId, groupId } = req.body ?? {};
+    if (!vehicleId) return res.status(400).json({ error: 'falta vehicleId' });
+    const [r] = await sendForVehiclesQanalytics({ vehicleIds: [vehicleId], groupId });
+    res.json(r);
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.post('/api/qanalytics/groups/:id/send', async (req, res) => {
+  try {
+    const results = await sendForVehiclesQanalytics({ groupId: req.params.id });
+    res.json({ results });
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+app.get('/api/qanalytics/history', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const groupId = req.query.groupId ? String(req.query.groupId) : null;
+  const entries = await db.getHistory('qanalytics', { limit, groupId });
+  res.json({ entries });
+});
+
+// Scheduler Qanalytics — chequea cada 5s, dispara cuando toca (mínimo 20s entre llamadas)
+const QANALYTICS_TICK_MS = 5000;
+setInterval(async () => {
+  try { await ensureGroupsCache(); } catch { return; }
+  const now = Date.now();
+  for (const fmGroup of groupsCache.groups) {
+    if (!isQanalyticsGroupAllowed(fmGroup)) continue;
+    const config = qanalyticsGroups[fmGroup.id];
+    if (!config?.enabled) continue;
+    if (!fmGroup.vehicles?.length) continue;
+    const last = config.lastRunAt ? new Date(config.lastRunAt).getTime() : 0;
+    if (now - last < (config.intervalSec || 60) * 1000) continue;
+    config.lastRunAt = new Date().toISOString();
+    try {
+      const results = await sendForVehiclesQanalytics({ groupId: fmGroup.id });
+      const accepted = results.filter((x) => x.accepted).length;
+      const okCount = results.filter((x) => x.ok).length;
+      const failed = results.filter((x) => !x.ok).length;
+      config.lastSummary = { total: results.length, accepted, ok: okCount, failed };
+      config.lastStatus = failed === 0 ? (accepted === results.length ? 'ok' : 'partial') : 'err';
+      await saveQanalyticsGroups();
+    } catch (err) {
+      config.lastStatus = 'err';
+      config.lastSummary = { error: String(err) };
+      await appendLog({ kind: 'qanalytics_scheduler_error', groupId: fmGroup.id, error: String(err) });
+      await saveQanalyticsGroups();
+    }
+  }
+}, QANALYTICS_TICK_MS);
+
 app.listen(PORT, () => {
   console.log(`track-service · http://localhost:${PORT}`);
   if (!FM_TRACK_API_KEY) console.warn('  ⚠  FM_TRACK_API_KEY no configurada');
@@ -1861,6 +2123,7 @@ app.listen(PORT, () => {
   if (!DRIVIN_API_KEY) console.warn('  ⚠  DRIVIN_API_KEY no configurado');
   if (!BERMANN_ID_CLIENTE_EXTERNO || !BERMANN_USERNAME || !BERMANN_PASSWORD) console.warn('  ⚠  Credenciales Bermann no configuradas');
   if (!DS_EMPRESA || !DS_RUT) console.warn('  ⚠  Credenciales DS no configuradas (empresa + rut transportista)');
+  if (!QANALYTICS_USERNAME || !QANALYTICS_PASSWORD) console.warn('  ⚠  Credenciales Qanalytics no configuradas (usuario + contraseña Basic Auth)');
   if (AUTH_ENABLED) {
     console.log(`  auth · ACTIVADA · ${AUTH_USERS.size} cuenta(s)`);
     if (!process.env.AUTH_SECRET) console.warn('  ⚠  AUTH_SECRET no definido — las sesiones se invalidan en cada reinicio. Define AUTH_SECRET en .env.');
