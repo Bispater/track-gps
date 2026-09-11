@@ -1951,6 +1951,23 @@ function buildQanalyticsItem(obj, pos) {
   return item;
 }
 
+// Rate-limit global Qanalytics: su API exige >=20s entre llamadas a inserta_posiciones,
+// venga de donde venga (scheduler, envío manual, reintento tras 401). Serializamos todas
+// las llamadas y las espaciamos con 1s de colchón; sin esto responden 400/429.
+const QANALYTICS_MIN_GAP_MS = 21000;
+let qanalyticsLastCallAt = 0;
+let qanalyticsQueue = Promise.resolve();
+function withQanalyticsRateLimit(fn) {
+  const run = qanalyticsQueue.then(async () => {
+    const wait = qanalyticsLastCallAt + QANALYTICS_MIN_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+    qanalyticsLastCallAt = Date.now();
+    return fn();
+  });
+  qanalyticsQueue = run.then(() => {}, () => {});
+  return run;
+}
+
 // Un solo POST con el array completo de posiciones (la doc recomienda batchear)
 async function sendBatchToQanalytics(items) {
   const base = QANALYTICS_API_URL.replace(/\/+$/, '');
@@ -1968,8 +1985,8 @@ async function sendBatchToQanalytics(items) {
       },
       body: JSON.stringify(items),
     });
-    let r = await doPost(await getQanalyticsToken());
-    if (r.status === 401) r = await doPost(await getQanalyticsToken(true));
+    let r = await withQanalyticsRateLimit(async () => doPost(await getQanalyticsToken()));
+    if (r.status === 401) r = await withQanalyticsRateLimit(async () => doPost(await getQanalyticsToken(true)));
     const text = await r.text();
     let body; try { body = JSON.parse(text); } catch { body = text; }
     const message = (body && typeof body === 'object' && body.message) ? String(body.message) : '';
