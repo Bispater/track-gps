@@ -1857,6 +1857,15 @@ setInterval(async () => {
   }
 }, DS_TICK_MS);
 
+// ===================== Métricas (dashboard) =====================
+app.get('/api/stats/sends', async (req, res) => {
+  try {
+    const allowed = new Set([24, 48, 168]);
+    const hours = Number(req.query.hours) || 24;
+    res.json(await db.getSendStats({ hours: allowed.has(hours) ? hours : 24 }));
+  } catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
 // ===================== Qanalytics (Q Integración) =====================
 const appendQanalyticsHistory = (e) => db.appendHistory('qanalytics', e);
 

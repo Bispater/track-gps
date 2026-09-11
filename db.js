@@ -233,6 +233,68 @@ export async function saveLastSent(client, vehicleId, datetime) {
 }
 
 // ---------- retención ----------
+// ---------- métricas ----------
+// Agregados de send_history para el dashboard de métricas. Excluye los envíos
+// omitidos por dedupe (entry.skipped): no son llamadas reales al cliente.
+export async function getSendStats({ hours = 24 } = {}) {
+  const bucket = hours <= 48 ? 'hour' : 'day';
+  const notSkipped = `COALESCE((entry->>'skipped')::boolean, false) = false`;
+  const range = `ts >= now() - make_interval(hours => $1)`;
+  const [series, byClient, topErrors, prev] = await Promise.all([
+    pool.query(
+      `SELECT date_trunc('${bucket}', ts) AS bucket, client,
+              count(*) FILTER (WHERE accepted)::int                    AS aceptados,
+              count(*) FILTER (WHERE ok AND accepted IS NOT TRUE)::int AS rechazados,
+              count(*) FILTER (WHERE ok IS NOT TRUE)::int              AS errores
+         FROM send_history
+        WHERE ${range} AND ${notSkipped}
+        GROUP BY 1, 2 ORDER BY 1`,
+      [hours]
+    ),
+    pool.query(
+      `SELECT client,
+              count(*)::int AS total,
+              count(*) FILTER (WHERE accepted)::int                    AS aceptados,
+              count(*) FILTER (WHERE ok AND accepted IS NOT TRUE)::int AS rechazados,
+              count(*) FILTER (WHERE ok IS NOT TRUE)::int              AS errores,
+              count(DISTINCT vehicle_id) FILTER (WHERE accepted)::int  AS vehiculos
+         FROM send_history
+        WHERE ${range} AND ${notSkipped}
+        GROUP BY client ORDER BY total DESC`,
+      [hours]
+    ),
+    pool.query(
+      `SELECT vehicle_id, client,
+              count(*)::int AS fallos,
+              max(ts)       AS ultimo,
+              (array_agg(COALESCE(entry->>'error', entry->'response'->>'error',
+                                  'HTTP ' || COALESCE(status::text, '0')) ORDER BY ts DESC))[1] AS detalle
+         FROM send_history
+        WHERE ${range} AND ok IS NOT TRUE AND vehicle_id IS NOT NULL
+        GROUP BY vehicle_id, client
+        ORDER BY fallos DESC, ultimo DESC
+        LIMIT 8`,
+      [hours]
+    ),
+    pool.query(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE accepted)::int AS aceptados
+         FROM send_history
+        WHERE ts >= now() - make_interval(hours => $1::int * 2)
+          AND ts <  now() - make_interval(hours => $1)
+          AND ${notSkipped}`,
+      [hours]
+    ),
+  ]);
+  return {
+    bucket,
+    series: series.rows.map((r) => ({ ...r, bucket: r.bucket.toISOString() })),
+    byClient: byClient.rows,
+    topErrors: topErrors.rows.map((r) => ({ ...r, ultimo: r.ultimo.toISOString() })),
+    prev: prev.rows[0] || { total: 0, aceptados: 0 },
+  };
+}
+
 export async function pruneHistory(days) {
   const r1 = await pool.query(`DELETE FROM send_history WHERE ts < now() - ($1 * interval '1 day')`, [days]);
   const r2 = await pool.query(`DELETE FROM activity_log WHERE ts < now() - ($1 * interval '1 day')`, [days]);
