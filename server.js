@@ -1707,9 +1707,14 @@ async function sendOneToDs({ payload }) {
     });
     const text = await r.text();
     let body; try { body = JSON.parse(text); } catch { body = text; }
-    // DS devuelve HTTP 200 con { estado: "OK"|"Error", mensaje: "..." }
-    const accepted = r.ok && body && typeof body === 'object' && String(body.estado).toUpperCase() === 'OK';
-    const message = (body && typeof body === 'object' && body.mensaje) ? String(body.mensaje) : '';
+    // DS responde con dos formatos según versión de su API:
+    //   doc original:  { estado: "OK"|"Error", mensaje: "..." }
+    //   API actual:    { error: false|true, message: "Data actualizada."|"Data guardada." } (HTTP 201)
+    const isObj = body && typeof body === 'object';
+    const okEstado = isObj && typeof body.estado === 'string' && body.estado.toUpperCase() === 'OK';
+    const okErrorFlag = isObj && body.error === false;
+    const accepted = r.ok && (okEstado || okErrorFlag);
+    const message = isObj ? String(body.mensaje || body.message || '') : '';
     return { ok: r.ok, status: r.status, accepted, message, response: body, url: DS_API_URL };
   } catch (err) {
     return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url: DS_API_URL };
