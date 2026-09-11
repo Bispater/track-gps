@@ -2010,6 +2010,8 @@ async function sendForVehiclesQanalytics({ groupId, vehicleIds }) {
 app.get('/api/qanalytics/config', (_req, res) => {
   res.json({
     url: QANALYTICS_API_URL,
+    // La API de test de Qanalytics termina en "_test"; la de prod la entregan aparte
+    env: QANALYTICS_API_URL.toLowerCase().includes('_test') ? 'test' : 'prod',
     credentialsConfigured: Boolean(QANALYTICS_USERNAME && QANALYTICS_PASSWORD),
     username: QANALYTICS_USERNAME || null,
   });
