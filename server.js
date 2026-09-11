@@ -2064,8 +2064,6 @@ app.get('/api/qanalytics/config', (_req, res) => {
     apikeyProdConfigured: Boolean(QANALYTICS_PROD_API_URL && QANALYTICS_PROD_USERNAME && QANALYTICS_PROD_PASSWORD),
     username: QANALYTICS_USERNAME || null,
     prodUsername: QANALYTICS_PROD_USERNAME || null,
-    // Cambiar un grupo a prod exige confirmar la contraseña del login (si la auth está activa)
-    prodRequiresPassword: AUTH_ENABLED,
   });
 });
 
@@ -2095,13 +2093,6 @@ app.put('/api/qanalytics/groups/:id', async (req, res) => {
   if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
   if (req.body?.env != null) {
     const nextEnv = req.body.env === 'prod' ? 'prod' : 'test';
-    // Pasar a PRODUCCIÓN exige re-confirmar la contraseña del usuario logueado
-    if (nextEnv === 'prod' && prev.env !== 'prod' && AUTH_ENABLED) {
-      const expected = AUTH_USERS.get(String(req.user || ''));
-      if (expected == null || !safeEqual(expected, String(req.body.confirmPassword || ''))) {
-        return res.status(403).json({ error: 'Contraseña incorrecta: no se cambió a producción' });
-      }
-    }
     if (nextEnv === 'prod' && !(QANALYTICS_PROD_API_URL && QANALYTICS_PROD_USERNAME && QANALYTICS_PROD_PASSWORD)) {
       return res.status(400).json({ error: 'Credenciales de producción no configuradas (QANALYTICS_PROD_* en .env)' });
     }
