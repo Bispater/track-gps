@@ -42,6 +42,9 @@ const {
   QANALYTICS_API_URL = 'https://ww3.qanalytics.cl/Api_InsertaPosicion_General_test',
   QANALYTICS_USERNAME = '',
   QANALYTICS_PASSWORD = '',
+  QANALYTICS_PROD_API_URL = '',
+  QANALYTICS_PROD_USERNAME = '',
+  QANALYTICS_PROD_PASSWORD = '',
   QANALYTICS_GROUPS = '',
 } = process.env;
 
@@ -1877,7 +1880,17 @@ const appendQanalyticsHistory = (e) => db.appendHistory('qanalytics', e);
 let qanalyticsGroups = {};
 function defaultQanalyticsGroupConfig() {
   // Qanalytics exige >=20s entre llamadas; cada patente reporta máx cada 1 min con motor encendido.
-  return { intervalSec: 60, enabled: false, lastRunAt: null, lastStatus: null, lastSummary: null };
+  // env: 'test' | 'prod' — cada entorno tiene su propia URL y credenciales.
+  return { intervalSec: 60, enabled: false, env: 'test', lastRunAt: null, lastStatus: null, lastSummary: null };
+}
+// Config de entorno: test (por defecto) o producción
+function qanalyticsEnvCfg(env) {
+  return env === 'prod'
+    ? { env: 'prod', base: QANALYTICS_PROD_API_URL.replace(/\/+$/, ''), user: QANALYTICS_PROD_USERNAME, pass: QANALYTICS_PROD_PASSWORD }
+    : { env: 'test', base: QANALYTICS_API_URL.replace(/\/+$/, ''), user: QANALYTICS_USERNAME, pass: QANALYTICS_PASSWORD };
+}
+function qanalyticsGroupEnv(groupId) {
+  return groupId && qanalyticsGroups[groupId]?.env === 'prod' ? 'prod' : 'test';
 }
 async function loadQanalyticsGroups() {
   qanalyticsGroups = await db.loadGroupConfigs('qanalytics');
@@ -1895,14 +1908,15 @@ function toQanalyticsDatetime(ts) {
 }
 
 // Token: POST /Genera_Token con Basic Auth → accessToken Bearer, dura 3h.
-// Cache en memoria con margen de 10 min; ante 401 se regenera y reintenta una vez.
-let qanalyticsToken = { token: null, expiresAt: 0 };
+// Cache en memoria POR ENTORNO con margen de 10 min; ante 401 se regenera y reintenta una vez.
+const qanalyticsTokens = { test: { token: null, expiresAt: 0 }, prod: { token: null, expiresAt: 0 } };
 const QANALYTICS_TOKEN_TTL_MS = (3 * 60 - 10) * 60 * 1000;
-async function getQanalyticsToken(force = false) {
-  if (!force && qanalyticsToken.token && Date.now() < qanalyticsToken.expiresAt) return qanalyticsToken.token;
-  const base = QANALYTICS_API_URL.replace(/\/+$/, '');
-  const basic = Buffer.from(`${QANALYTICS_USERNAME}:${QANALYTICS_PASSWORD}`).toString('base64');
-  const r = await fetch(`${base}/Genera_Token/`, {
+async function getQanalyticsToken(env, force = false) {
+  const cache = qanalyticsTokens[env] || qanalyticsTokens.test;
+  if (!force && cache.token && Date.now() < cache.expiresAt) return cache.token;
+  const cfg = qanalyticsEnvCfg(env);
+  const basic = Buffer.from(`${cfg.user}:${cfg.pass}`).toString('base64');
+  const r = await fetch(`${cfg.base}/Genera_Token/`, {
     method: 'POST',
     headers: { Accept: 'application/json', Authorization: `Basic ${basic}` },
   });
@@ -1910,10 +1924,11 @@ async function getQanalyticsToken(force = false) {
   let body; try { body = JSON.parse(text); } catch { body = text; }
   if (!r.ok || !body?.accessToken) {
     const detail = typeof body === 'string' ? body.slice(0, 200) : JSON.stringify(body);
-    throw new Error(`Genera_Token HTTP ${r.status}: ${detail}`);
+    throw new Error(`Genera_Token (${cfg.env}) HTTP ${r.status}: ${detail}`);
   }
-  qanalyticsToken = { token: body.accessToken, expiresAt: Date.now() + QANALYTICS_TOKEN_TTL_MS };
-  return qanalyticsToken.token;
+  cache.token = body.accessToken;
+  cache.expiresAt = Date.now() + QANALYTICS_TOKEN_TTL_MS;
+  return cache.token;
 }
 
 function buildQanalyticsItem(obj, pos) {
@@ -1954,26 +1969,28 @@ function buildQanalyticsItem(obj, pos) {
 // Rate-limit global Qanalytics: su API exige >=20s entre llamadas a inserta_posiciones,
 // venga de donde venga (scheduler, envío manual, reintento tras 401). Serializamos todas
 // las llamadas y las espaciamos con 1s de colchón; sin esto responden 400/429.
+// Un limitador por entorno: test y prod son cuentas/endpoints independientes.
 const QANALYTICS_MIN_GAP_MS = 21000;
-let qanalyticsLastCallAt = 0;
-let qanalyticsQueue = Promise.resolve();
-function withQanalyticsRateLimit(fn) {
-  const run = qanalyticsQueue.then(async () => {
-    const wait = qanalyticsLastCallAt + QANALYTICS_MIN_GAP_MS - Date.now();
+const qanalyticsRate = { test: { lastCallAt: 0, queue: Promise.resolve() }, prod: { lastCallAt: 0, queue: Promise.resolve() } };
+function withQanalyticsRateLimit(env, fn) {
+  const st = qanalyticsRate[env] || qanalyticsRate.test;
+  const run = st.queue.then(async () => {
+    const wait = st.lastCallAt + QANALYTICS_MIN_GAP_MS - Date.now();
     if (wait > 0) await new Promise((res) => setTimeout(res, wait));
-    qanalyticsLastCallAt = Date.now();
+    st.lastCallAt = Date.now();
     return fn();
   });
-  qanalyticsQueue = run.then(() => {}, () => {});
+  st.queue = run.then(() => {}, () => {});
   return run;
 }
 
 // Un solo POST con el array completo de posiciones (la doc recomienda batchear)
-async function sendBatchToQanalytics(items) {
-  const base = QANALYTICS_API_URL.replace(/\/+$/, '');
-  const url = `${base}/inserta_posiciones/`;
-  if (!QANALYTICS_USERNAME || !QANALYTICS_PASSWORD) {
-    return { ok: false, status: 0, accepted: false, response: { error: 'QANALYTICS_USERNAME y QANALYTICS_PASSWORD no configurados en .env' }, url };
+async function sendBatchToQanalytics(items, env = 'test') {
+  const cfg = qanalyticsEnvCfg(env);
+  const url = `${cfg.base}/inserta_posiciones/`;
+  if (!cfg.base || !cfg.user || !cfg.pass) {
+    const pref = env === 'prod' ? 'QANALYTICS_PROD_*' : 'QANALYTICS_*';
+    return { ok: false, status: 0, accepted: false, env, response: { error: `Credenciales Qanalytics ${env} no configuradas (${pref} en .env)` }, url };
   }
   try {
     const doPost = async (token) => fetch(url, {
@@ -1985,14 +2002,14 @@ async function sendBatchToQanalytics(items) {
       },
       body: JSON.stringify(items),
     });
-    let r = await withQanalyticsRateLimit(async () => doPost(await getQanalyticsToken()));
-    if (r.status === 401) r = await withQanalyticsRateLimit(async () => doPost(await getQanalyticsToken(true)));
+    let r = await withQanalyticsRateLimit(env, async () => doPost(await getQanalyticsToken(env)));
+    if (r.status === 401) r = await withQanalyticsRateLimit(env, async () => doPost(await getQanalyticsToken(env, true)));
     const text = await r.text();
     let body; try { body = JSON.parse(text); } catch { body = text; }
     const message = (body && typeof body === 'object' && body.message) ? String(body.message) : '';
-    return { ok: r.ok, status: r.status, accepted: r.ok, message, response: body, url };
+    return { ok: r.ok, status: r.status, accepted: r.ok, message, env, response: body, url };
   } catch (err) {
-    return { ok: false, status: 0, accepted: false, response: { error: String(err) }, url };
+    return { ok: false, status: 0, accepted: false, env, response: { error: String(err) }, url };
   }
 }
 
@@ -2024,7 +2041,7 @@ async function sendForVehiclesQanalytics({ groupId, vehicleIds }) {
     }
   }
   if (!items.length) return results;
-  const batchResp = await sendBatchToQanalytics(items.map((x) => x.item));
+  const batchResp = await sendBatchToQanalytics(items.map((x) => x.item), qanalyticsGroupEnv(groupId));
   for (const it of items) {
     const entry = {
       vehicleId: it.vehicleId,
@@ -2039,12 +2056,16 @@ async function sendForVehiclesQanalytics({ groupId, vehicleIds }) {
 }
 
 app.get('/api/qanalytics/config', (_req, res) => {
+  // Misma forma que Falabella para que el frontend muestre el par Test/Prod con switch por grupo
   res.json({
-    url: QANALYTICS_API_URL,
-    // La API de test de Qanalytics termina en "_test"; la de prod la entregan aparte
-    env: QANALYTICS_API_URL.toLowerCase().includes('_test') ? 'test' : 'prod',
-    credentialsConfigured: Boolean(QANALYTICS_USERNAME && QANALYTICS_PASSWORD),
+    testUrl: QANALYTICS_API_URL,
+    prodUrl: QANALYTICS_PROD_API_URL || null,
+    apikeyTestConfigured: Boolean(QANALYTICS_USERNAME && QANALYTICS_PASSWORD),
+    apikeyProdConfigured: Boolean(QANALYTICS_PROD_API_URL && QANALYTICS_PROD_USERNAME && QANALYTICS_PROD_PASSWORD),
     username: QANALYTICS_USERNAME || null,
+    prodUsername: QANALYTICS_PROD_USERNAME || null,
+    // Cambiar un grupo a prod exige confirmar la contraseña del login (si la auth está activa)
+    prodRequiresPassword: AUTH_ENABLED,
   });
 });
 
@@ -2072,6 +2093,20 @@ app.put('/api/qanalytics/groups/:id', async (req, res) => {
   // Qanalytics exige mínimo 20s entre llamadas al servicio
   if (req.body?.intervalSec != null) next.intervalSec = Math.max(20, Number(req.body.intervalSec) || 60);
   if (req.body?.enabled != null) next.enabled = Boolean(req.body.enabled);
+  if (req.body?.env != null) {
+    const nextEnv = req.body.env === 'prod' ? 'prod' : 'test';
+    // Pasar a PRODUCCIÓN exige re-confirmar la contraseña del usuario logueado
+    if (nextEnv === 'prod' && prev.env !== 'prod' && AUTH_ENABLED) {
+      const expected = AUTH_USERS.get(String(req.user || ''));
+      if (expected == null || !safeEqual(expected, String(req.body.confirmPassword || ''))) {
+        return res.status(403).json({ error: 'Contraseña incorrecta: no se cambió a producción' });
+      }
+    }
+    if (nextEnv === 'prod' && !(QANALYTICS_PROD_API_URL && QANALYTICS_PROD_USERNAME && QANALYTICS_PROD_PASSWORD)) {
+      return res.status(400).json({ error: 'Credenciales de producción no configuradas (QANALYTICS_PROD_* en .env)' });
+    }
+    next.env = nextEnv;
+  }
   qanalyticsGroups[id] = next;
   await saveQanalyticsGroups();
   res.json(next);
