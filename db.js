@@ -7,6 +7,8 @@
 //   - send_history     → historial de envíos por cliente (lo que iban a los *-history.jsonl)
 //   - activity_log     → log general (lo que iba a activity.jsonl)
 //   - blocked_vehicle  → vehículos bloqueados por cliente (ej: Wise estado 4)
+//   - position_history → posiciones GPS tal como llegan de fm-track (alimenta el historial
+//                        del mapa sin volver a consultar fm-track)
 //
 // La cache de fm-track (objects/positions/groups) NO se persiste: vive en RAM
 // porque es solo un espejo TTL de la API de fm-track.
@@ -67,6 +69,20 @@ CREATE TABLE IF NOT EXISTS blocked_vehicle (
   reason     TEXT,
   ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (client, vehicle_id)
+);
+
+-- Posiciones GPS crudas por vehículo. Se llenan con lo que el refresh de fm-track ya trae
+-- (últimos 60 min de cada vehículo cada 10 s) → el historial del mapa se sirve desde aquí.
+CREATE TABLE IF NOT EXISTS position_history (
+  vehicle_id TEXT             NOT NULL,
+  ts         TIMESTAMPTZ      NOT NULL,
+  lat        DOUBLE PRECISION NOT NULL,
+  lng        DOUBLE PRECISION NOT NULL,
+  speed      REAL,
+  direction  REAL,
+  ignition   SMALLINT,
+  odometer   DOUBLE PRECISION,
+  PRIMARY KEY (vehicle_id, ts)
 );
 
 -- Último datetime de posición enviado y ACEPTADO por vehículo, para no reinyectar
@@ -230,6 +246,67 @@ export async function saveLastSent(client, vehicleId, datetime) {
      ON CONFLICT (client, vehicle_id) DO UPDATE SET datetime = EXCLUDED.datetime, updated_at = now()`,
     [client, String(vehicleId), datetime ?? null]
   );
+}
+
+// ---------- position_history ----------
+// rows: puntos normalizados de track-analysis.js ({ t, lat, lng, speed, dir, ign, odo }).
+// Inserta en lotes; los repetidos (misma PK vehicle_id+ts) se ignoran.
+export async function insertPositions(vehicleId, rows) {
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += 500) {
+    const chunk = rows.slice(i, i + 500);
+    const values = [];
+    const params = [];
+    chunk.forEach((r, j) => {
+      const b = j * 8;
+      values.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8})`);
+      params.push(String(vehicleId), new Date(r.t), r.lat, r.lng, r.speed ?? null, r.dir ?? null, r.ign ?? null, r.odo ?? null);
+    });
+    const res = await pool.query(
+      `INSERT INTO position_history (vehicle_id, ts, lat, lng, speed, direction, ignition, odometer)
+       VALUES ${values.join(',')} ON CONFLICT DO NOTHING`,
+      params
+    );
+    inserted += res.rowCount || 0;
+  }
+  return inserted;
+}
+export async function getPositions(vehicleId, from, to) {
+  const { rows } = await pool.query(
+    `SELECT ts, lat, lng, speed, direction, ignition, odometer
+       FROM position_history WHERE vehicle_id = $1 AND ts >= $2 AND ts <= $3 ORDER BY ts`,
+    [String(vehicleId), from, to]
+  );
+  return rows.map((r) => ({
+    t: r.ts.getTime(), lat: r.lat, lng: r.lng,
+    speed: r.speed ?? 0, dir: r.direction ?? null, ign: r.ignition ?? null, odo: r.odometer ?? null,
+  }));
+}
+// Primer/último ts guardado por vehículo (para saber desde cuándo hay cobertura local)
+export async function getPositionCoverage(vehicleId) {
+  const { rows } = await pool.query(
+    'SELECT min(ts) AS first, max(ts) AS last, count(*)::int AS n FROM position_history WHERE vehicle_id = $1',
+    [String(vehicleId)]
+  );
+  const r = rows[0] || {};
+  return { first: r.first || null, last: r.last || null, n: r.n || 0 };
+}
+// ts recientes ya guardados (para no reinsertar lo mismo en cada refresh)
+export async function loadRecentPositionTs(minutes) {
+  const { rows } = await pool.query(
+    `SELECT vehicle_id, ts FROM position_history WHERE ts > now() - make_interval(mins => $1)`,
+    [minutes]
+  );
+  const map = new Map();
+  for (const r of rows) {
+    if (!map.has(r.vehicle_id)) map.set(r.vehicle_id, new Set());
+    map.get(r.vehicle_id).add(r.ts.getTime());
+  }
+  return map;
+}
+export async function prunePositions(days) {
+  const r = await pool.query(`DELETE FROM position_history WHERE ts < now() - ($1 * interval '1 day')`, [days]);
+  return r.rowCount || 0;
 }
 
 // ---------- retención ----------

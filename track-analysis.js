@@ -15,11 +15,14 @@
 //   - Saltos imposibles (> glitchKmh implícitos y > 1 km) se descartan como error GPS.
 //   - Paradas: corridas estacionarias de al menos stopMinSec. Las más cortas
 //     (semáforos, peajes) se funden dentro del viaje.
+//   - Un desplazamiento < tripMinKm entre dos paradas (acomodar el camión en un
+//     patio) no es un viaje: se funde con las paradas vecinas en una sola.
 //   - Si el equipo deja de reportar estando quieto (muy común con motor apagado),
 //     el hueco entre reportes cuenta como parada.
 
 export const DEFAULTS = {
   stopMinSec: 300,          // 5 min quieto = parada
+  tripMinKm: 0.5,           // un desplazamiento menor entre dos paradas es una maniobra, no un viaje
   stationarySpeedKmh: 3,    // bajo esto se considera detenido
   stationaryRadiusKm: 0.15, // desplazamiento mínimo para contar movimiento
   glitchKmh: 180,           // velocidad implícita imposible → salto GPS
@@ -194,8 +197,14 @@ export function analyzeTrack(rawPoints, opts = {}) {
     if (!r.moving && r.dtSec < o.stopMinSec) { r.moving = true; r.movSec = r.dtSec; }
   }
   runs = mergeAdjacent(runs);
+  // 4) Maniobras: movimiento corto entre dos paradas → se funde con ellas en una sola parada
+  for (let i = 1; i < runs.length - 1; i++) {
+    const r = runs[i];
+    if (r.moving && r.distKm < o.tripMinKm && !runs[i - 1].moving && !runs[i + 1].moving) { r.moving = false; r.movSec = 0; }
+  }
+  runs = mergeAdjacent(runs);
 
-  // 4) Viajes y paradas
+  // 5) Viajes y paradas
   const trips = [];
   const stops = [];
   const path = [];
@@ -230,7 +239,8 @@ export function analyzeTrack(rawPoints, opts = {}) {
     if (r.moving) {
       let maxSpeed = 0;
       for (const p of seg) if (p.speed <= 200) maxSpeed = Math.max(maxSpeed, p.speed);
-      const odoOk = a.odo != null && b.odo != null && b.odo >= a.odo && (b.odo - a.odo) < 5000;
+      const odoOk = a.odo != null && b.odo != null && b.odo >= a.odo && (b.odo - a.odo) < 5000
+        && (b.odo > a.odo || r.distKm < 0.5);
       trips.push({
         idx: trips.length,
         startTs: toIso(a.t), endTs: toIso(b.t),
@@ -259,14 +269,17 @@ export function analyzeTrack(rawPoints, opts = {}) {
     }
   }
 
-  // 5) Resumen
+  // 6) Resumen
   let maxSpeed = 0;
   for (const p of points) if (p.speed <= 200) maxSpeed = Math.max(maxSpeed, p.speed);
   const distanceKm = trips.reduce((s, t) => s + t.distanceKm, 0);
   const movingSec = trips.reduce((s, t) => s + t.movingSec, 0);
   const stoppedSec = stops.reduce((s, t) => s + t.durationSec, 0);
   const first = points[0], last = points[n - 1];
-  const odoOk = first.odo != null && last.odo != null && last.odo >= first.odo && (last.odo - first.odo) < 20000;
+  // Odómetro válido solo si existe, no retrocede y realmente avanzó (un equipo que no
+  // reporta kilometraje entrega el mismo valor siempre → mostrar 0 km sería engañoso).
+  const odoOk = first.odo != null && last.odo != null && last.odo >= first.odo && (last.odo - first.odo) < 20000
+    && (last.odo > first.odo || distanceKm < 0.5);
   Object.assign(summary, {
     distanceKm: r3(distanceKm),
     odometerKm: odoOk ? r3(last.odo - first.odo) : null,

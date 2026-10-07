@@ -51,9 +51,14 @@ Para obtener la última posición se consulta con una ventana de tiempo y se tom
 **No existe** un endpoint bulk de "last known position".
 
 Parámetros opcionales: `limit` (default 100, máx 1000) y `continuationToken` (viene como
-`continuation_token` en la respuesta cuando hay más registros que `limit`). El historial del mapa
-(`GET /api/vehicles/:id/track`, ver `track-history.js`) pagina con estos dos parámetros y analiza
-los puntos en `track-analysis.js` (km por GPS y por odómetro `calculated_inputs.mileage`, viajes, paradas).
+`continuation_token` en la respuesta cuando hay más registros que `limit`).
+
+**Carga sobre fm-track.** El refresh de posiciones (cada 10 s) hace una llamada por vehículo con
+ventana de 60 min, de a `FM_TRACK_CONCURRENCY` a la vez. Todos los puntos que llegan se guardan en
+Postgres (`position_history`). El historial del mapa (`GET /api/vehicles/:id/track`, `track-history.js`)
+se sirve desde esa tabla; solo consulta fm-track (paginando con `limit`/`continuationToken`) para
+rellenar, una única vez, tramos anteriores a lo guardado. El análisis (km por GPS y por odómetro
+`calculated_inputs.mileage`, viajes, paradas) está en `track-analysis.js`.
 
 **Response**:
 ```json

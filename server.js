@@ -2,7 +2,8 @@ import 'dotenv/config';
 import express from 'express';
 import crypto from 'node:crypto';
 import * as db from './db.js';
-import { registerTrackRoutes } from './track-history.js';
+import { mapLimit, registerTrackRoutes } from './track-history.js';
+import { normalizePoints } from './track-analysis.js';
 
 const {
   FM_TRACK_BASE_URL = 'https://api.fm-track.com',
@@ -94,10 +95,17 @@ const appendLog = (e) => db.appendActivity(e);
 // Cada día se borran de Postgres los registros más viejos que RETENTION_DAYS.
 const RETENTION_DAYS = Math.max(1, Number(process.env.RETENTION_DAYS || 15));
 
+// Posiciones GPS guardadas localmente (historial del mapa): retención propia, más larga.
+const POSITION_RETENTION_DAYS = Math.max(1, Number(process.env.POSITION_RETENTION_DAYS || 15));
+
 async function pruneAllHistories() {
   const { removed } = await db.pruneHistory(RETENTION_DAYS);
   if (removed > 0) {
     console.log(`[retention] purgados ${removed} registros más viejos que ${RETENTION_DAYS} días`);
+  }
+  const removedPos = await db.prunePositions(POSITION_RETENTION_DAYS);
+  if (removedPos > 0) {
+    console.log(`[retention] purgadas ${removedPos} posiciones más viejas que ${POSITION_RETENTION_DAYS} días`);
   }
 }
 
@@ -126,6 +134,9 @@ async function callFmTrack(relPath, apiKey = FM_TRACK_API_KEY) {
 const POSITIONS_TTL_MS = 10000;
 const COORDS_LOOKBACK_MIN = 60;
 const GROUPS_TTL_MS = 30000;
+// Llamadas simultáneas a fm-track al refrescar posiciones. Antes salían las ~90 a la vez
+// y fm-track respondía 429 Too Many Requests a lo que llegara en ese instante.
+const FM_TRACK_CONCURRENCY = Math.max(1, Number(process.env.FM_TRACK_CONCURRENCY || 8));
 
 const positionsCachesByKey = new Map();   // apiKey → { fetchedAt, byId, objects }
 const groupsCachesByKey = new Map();      // apiKey → { fetchedAt, groups }
@@ -217,14 +228,41 @@ function pick(o, paths, fb) {
   return fb;
 }
 
+// ---------- persistencia de posiciones (position_history) ----------
+// Cada refresh ya trae los últimos 60 min de cada vehículo: en vez de botarlos, se guardan.
+// knownTs recuerda qué ts recientes ya están en la base para insertar solo lo nuevo
+// (incluye puntos "atrasados" que el equipo sube después de estar sin cobertura).
+const knownTs = new Map(); // vehicleId → Set<epoch ms>
+try {
+  for (const [k, v] of await db.loadRecentPositionTs(COORDS_LOOKBACK_MIN + 10)) knownTs.set(k, v);
+} catch (err) {
+  console.warn('[positions] no se pudo cargar el índice de posiciones recientes:', String(err));
+}
+async function persistCoordinates(objectId, items) {
+  const id = String(objectId);
+  const pts = normalizePoints(items);
+  if (!pts.length) return;
+  let set = knownTs.get(id);
+  if (!set) { set = new Set(); knownTs.set(id, set); }
+  const fresh = pts.filter((p) => !set.has(p.t));
+  if (fresh.length) {
+    await db.insertPositions(id, fresh);
+    for (const p of fresh) set.add(p.t);
+  }
+  const cutoff = Date.now() - (COORDS_LOOKBACK_MIN + 10) * 60 * 1000;
+  for (const t of set) if (t < cutoff) set.delete(t);
+}
+
 async function fetchLatestCoordinate(objectId, lookbackMin = COORDS_LOOKBACK_MIN, apiKey = FM_TRACK_API_KEY) {
   const to = new Date().toISOString();
   const from = new Date(Date.now() - lookbackMin * 60 * 1000).toISOString();
-  const path = `/objects/${encodeURIComponent(objectId)}/coordinates?fromDatetime=${encodeURIComponent(from)}&toDatetime=${encodeURIComponent(to)}`;
+  // limit=1000: el default de fm-track es 100 y la ventana de 60 min puede traer más puntos
+  const path = `/objects/${encodeURIComponent(objectId)}/coordinates?fromDatetime=${encodeURIComponent(from)}&toDatetime=${encodeURIComponent(to)}&limit=1000`;
   const r = await callFmTrack(path, apiKey);
   if (!r.ok) return null;
   const items = toArray(r.data?.items ?? r.data);
   if (!items.length) return null;
+  persistCoordinates(objectId, items).catch((err) => console.warn('[positions] error guardando posiciones:', String(err)));
   items.sort((a, b) => new Date(b.datetime || 0) - new Date(a.datetime || 0));
   return items[0];
 }
@@ -239,8 +277,8 @@ async function refreshPositionsCacheForKey(apiKey) {
   // Index para resolver tenant por vehicleId
   for (const id of ids) vehicleKeyIndex.set(String(id), apiKey);
 
-  const results = await Promise.allSettled(
-    ids.map((id) => fetchLatestCoordinate(id, COORDS_LOOKBACK_MIN, apiKey).then((p) => [String(id), p]))
+  const results = await mapLimit(ids, FM_TRACK_CONCURRENCY, (id) =>
+    fetchLatestCoordinate(id, COORDS_LOOKBACK_MIN, apiKey).then((p) => [String(id), p])
   );
   cache.byId = new Map();
   for (const r of results) {
@@ -2177,6 +2215,7 @@ setInterval(async () => {
 registerTrackRoutes(app, {
   callFmTrack,
   toArray,
+  db,
   // Resuelve el tenant fm-track del vehículo (multi-key); si aún no hay índice, fuerza un refresh.
   resolveApiKey: async (vehicleId) => {
     if (!vehicleKeyIndex.has(String(vehicleId))) await ensurePositions();
