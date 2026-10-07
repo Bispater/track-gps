@@ -50,6 +50,11 @@ Devuelve array directo de objetos.
 Para obtener la última posición se consulta con una ventana de tiempo y se toma el item con `datetime` más reciente.
 **No existe** un endpoint bulk de "last known position".
 
+Parámetros opcionales: `limit` (default 100, máx 1000) y `continuationToken` (viene como
+`continuation_token` en la respuesta cuando hay más registros que `limit`). El historial del mapa
+(`GET /api/vehicles/:id/track`, ver `track-history.js`) pagina con estos dos parámetros y analiza
+los puntos en `track-analysis.js` (km por GPS y por odómetro `calculated_inputs.mileage`, viajes, paradas).
+
 **Response**:
 ```json
 {

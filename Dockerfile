@@ -7,7 +7,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 
 # Código del backend (API-only: el frontend Angular se sirve en su propio contenedor)
-COPY server.js db.js ./
+COPY server.js db.js track-analysis.js track-history.js ./
 
 ENV NODE_ENV=production
 ENV PORT=3000

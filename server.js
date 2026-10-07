@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import crypto from 'node:crypto';
 import * as db from './db.js';
+import { registerTrackRoutes } from './track-history.js';
 
 const {
   FM_TRACK_BASE_URL = 'https://api.fm-track.com',
@@ -2171,6 +2172,17 @@ setInterval(async () => {
     }
   }
 }, QANALYTICS_TICK_MS);
+
+// ===================== Historial de recorrido (mapa) =====================
+registerTrackRoutes(app, {
+  callFmTrack,
+  toArray,
+  // Resuelve el tenant fm-track del vehículo (multi-key); si aún no hay índice, fuerza un refresh.
+  resolveApiKey: async (vehicleId) => {
+    if (!vehicleKeyIndex.has(String(vehicleId))) await ensurePositions();
+    return vehicleKeyIndex.get(String(vehicleId)) || FM_TRACK_API_KEY;
+  },
+});
 
 app.listen(PORT, () => {
   console.log(`track-service · http://localhost:${PORT}`);
