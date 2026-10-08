@@ -113,6 +113,40 @@ async function pruneAllHistories() {
 setTimeout(() => pruneAllHistories().catch(() => {}), 10 * 1000); // a los 10s del arranque
 setInterval(() => pruneAllHistories().catch(() => {}), 24 * 3600 * 1000);
 
+// ---------- Agregados de métricas (send_stats_hourly) ----------
+// Se preparan en segundo plano: en una base grande los índices y el primer rollup
+// pueden tardar minutos, y el scheduler no debe esperar. Luego se refrescan cada minuto.
+let statsReady = false;
+let statsRollupRunning = false;
+(async () => {
+  try {
+    const t0 = Date.now();
+    await db.ensureIndexes();
+    if (!(await db.getMeta('skipped_backfilled_at'))) {
+      const n = await db.backfillSkipped(RETENTION_DAYS + 1);
+      await db.setMeta('skipped_backfilled_at', new Date().toISOString());
+      console.log(`[stats] backfill skipped: ${n} filas`);
+    }
+    const cov = await db.getStatsCoverage();
+    // Primera vez: todo el período de retención. Reinicios: solo lo que pasó desde el último rollup.
+    const sinceHours = cov.updatedAt
+      ? Math.min(RETENTION_DAYS * 24 + 24, Math.ceil((Date.now() - cov.updatedAt.getTime()) / 3600e3) + 2)
+      : RETENTION_DAYS * 24 + 24;
+    await db.rollupSendStats({ sinceHours });
+    statsReady = true;
+    console.log(`[stats] agregados de métricas listos (${sinceHours} h recalculadas en ${Math.round((Date.now() - t0) / 1000)} s)`);
+  } catch (err) {
+    console.error('[stats] error preparando agregados de métricas:', String(err));
+  }
+})();
+setInterval(async () => {
+  if (!statsReady || statsRollupRunning) return;
+  statsRollupRunning = true;
+  try { await db.rollupSendStats({ sinceHours: 2 }); }
+  catch (err) { console.warn('[stats] rollup:', String(err)); }
+  finally { statsRollupRunning = false; }
+}, 60 * 1000);
+
 // ---------- fm-track (multi-tenant: una API key por tenant) ----------
 function buildFmTrackUrl(relPath, apiKey = FM_TRACK_API_KEY) {
   const slash = relPath.startsWith('/') ? '' : '/';
@@ -1905,11 +1939,19 @@ setInterval(async () => {
 }, DS_TICK_MS);
 
 // ===================== Métricas (dashboard) =====================
+// Cache corto: la pantalla de Métricas se refresca sola cada 60 s y varios usuarios
+// pueden tenerla abierta; los agregados se recalculan cada minuto de todas formas.
+const statsCache = new Map(); // hours → { at, body }
 app.get('/api/stats/sends', async (req, res) => {
   try {
     const allowed = new Set([24, 48, 168]);
-    const hours = Number(req.query.hours) || 24;
-    res.json(await db.getSendStats({ hours: allowed.has(hours) ? hours : 24 }));
+    const hoursRaw = Number(req.query.hours) || 24;
+    const hours = allowed.has(hoursRaw) ? hoursRaw : 24;
+    const hit = statsCache.get(hours);
+    if (hit && Date.now() - hit.at < 30 * 1000) return res.json(hit.body);
+    const body = { ...(await db.getSendStats({ hours })), ready: statsReady };
+    statsCache.set(hours, { at: Date.now(), body });
+    res.json(body);
   } catch (err) { res.status(500).json({ error: String(err) }); }
 });
 

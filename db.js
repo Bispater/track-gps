@@ -54,6 +54,34 @@ CREATE TABLE IF NOT EXISTS send_history (
 );
 CREATE INDEX IF NOT EXISTS idx_send_history_client_ts ON send_history (client, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_send_history_group     ON send_history (client, group_id, ts DESC);
+-- skipped como columna real (antes solo dentro del JSONB → las métricas parseaban cada fila)
+ALTER TABLE send_history ADD COLUMN IF NOT EXISTS skipped BOOLEAN NOT NULL DEFAULT false;
+
+-- Agregados por hora de send_history para el dashboard de métricas. Los mantiene
+-- rollupSendStats(): recalcula las últimas horas cada minuto. Leer de aquí es
+-- instantáneo; antes cada carga de Métricas recorría toda la tabla send_history.
+CREATE TABLE IF NOT EXISTS send_stats_hourly (
+  bucket     TIMESTAMPTZ NOT NULL,
+  client     TEXT        NOT NULL,
+  total      INTEGER     NOT NULL DEFAULT 0,
+  aceptados  INTEGER     NOT NULL DEFAULT 0,
+  rechazados INTEGER     NOT NULL DEFAULT 0,
+  errores    INTEGER     NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (bucket, client)
+);
+-- Vehículos con al menos un envío aceptado por hora y cliente (KPI "vehículos reportando")
+CREATE TABLE IF NOT EXISTS send_stats_vehicle_hourly (
+  bucket     TIMESTAMPTZ NOT NULL,
+  client     TEXT        NOT NULL,
+  vehicle_id TEXT        NOT NULL,
+  PRIMARY KEY (bucket, client, vehicle_id)
+);
+-- Marcas de mantenimiento (ej: backfill ya ejecutado)
+CREATE TABLE IF NOT EXISTS app_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
 
 CREATE TABLE IF NOT EXISTS activity_log (
   id    BIGSERIAL   PRIMARY KEY,
@@ -130,8 +158,8 @@ export async function getActivity(limit = 100) {
 // ---------- send_history ----------
 export async function appendHistory(client, entry) {
   await pool.query(
-    `INSERT INTO send_history (client, group_id, vehicle_id, ok, accepted, status, entry)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    `INSERT INTO send_history (client, group_id, vehicle_id, ok, accepted, status, skipped, entry)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [
       client,
       entry?.groupId ?? null,
@@ -139,9 +167,79 @@ export async function appendHistory(client, entry) {
       typeof entry?.ok === 'boolean' ? entry.ok : null,
       typeof entry?.accepted === 'boolean' ? entry.accepted : null,
       Number.isFinite(entry?.status) ? entry.status : null,
+      Boolean(entry?.skipped),
       entry ?? {},
     ]
   );
+}
+
+// ---------- mantenimiento de métricas ----------
+export async function getMeta(key) {
+  const { rows } = await pool.query('SELECT value FROM app_meta WHERE key = $1', [key]);
+  return rows[0]?.value ?? null;
+}
+export async function setMeta(key, value) {
+  await pool.query(
+    'INSERT INTO app_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+    [key, value == null ? null : String(value)]
+  );
+}
+// Índices por fecha. CONCURRENTLY no bloquea las escrituras del scheduler mientras se
+// construye, pero no puede ir dentro de una transacción → una sentencia por query.
+export async function ensureIndexes() {
+  const stmts = [
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_send_history_ts ON send_history (ts DESC)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_send_history_fail_ts ON send_history (ts DESC) WHERE ok IS NOT TRUE',
+  ];
+  for (const sql of stmts) await pool.query(sql);
+}
+// Marca skipped=true en las filas viejas que lo traían solo dentro del JSONB. Por lotes de
+// una hora (usa el índice por ts) para no bloquear la tabla.
+export async function backfillSkipped(days) {
+  let updated = 0;
+  const end = Date.now();
+  for (let t = end - days * 86400e3; t < end; t += 3600e3) {
+    const r = await pool.query(
+      `UPDATE send_history SET skipped = true
+        WHERE ts >= $1 AND ts < $2 AND skipped = false AND (entry->>'skipped')::boolean`,
+      [new Date(t), new Date(t + 3600e3)]
+    );
+    updated += r.rowCount || 0;
+    await new Promise((res) => setTimeout(res, 30));
+  }
+  return updated;
+}
+// Recalcula los agregados por hora desde `sinceHours` atrás (upsert por bucket+cliente).
+export async function rollupSendStats({ sinceHours = 2 } = {}) {
+  const from = `date_trunc('hour', now() - make_interval(hours => $1))`;
+  await pool.query(
+    `INSERT INTO send_stats_hourly (bucket, client, total, aceptados, rechazados, errores, updated_at)
+     SELECT date_trunc('hour', ts), client,
+            count(*)::int,
+            count(*) FILTER (WHERE accepted)::int,
+            count(*) FILTER (WHERE ok AND accepted IS NOT TRUE)::int,
+            count(*) FILTER (WHERE ok IS NOT TRUE)::int,
+            now()
+       FROM send_history
+      WHERE ts >= ${from} AND skipped = false
+      GROUP BY 1, 2
+     ON CONFLICT (bucket, client) DO UPDATE SET
+       total = EXCLUDED.total, aceptados = EXCLUDED.aceptados, rechazados = EXCLUDED.rechazados,
+       errores = EXCLUDED.errores, updated_at = now()`,
+    [sinceHours]
+  );
+  await pool.query(
+    `INSERT INTO send_stats_vehicle_hourly (bucket, client, vehicle_id)
+     SELECT DISTINCT date_trunc('hour', ts), client, vehicle_id
+       FROM send_history
+      WHERE ts >= ${from} AND accepted AND vehicle_id IS NOT NULL
+     ON CONFLICT DO NOTHING`,
+    [sinceHours]
+  );
+}
+export async function getStatsCoverage() {
+  const { rows } = await pool.query('SELECT max(bucket) AS last_bucket, max(updated_at) AS updated_at, count(*)::int AS n FROM send_stats_hourly');
+  return { lastBucket: rows[0]?.last_bucket || null, updatedAt: rows[0]?.updated_at || null, n: rows[0]?.n || 0 };
 }
 export async function getHistory(client, { limit = 200, groupId = null } = {}) {
   const params = [client];
@@ -311,70 +409,97 @@ export async function prunePositions(days) {
 
 // ---------- retención ----------
 // ---------- métricas ----------
-// Agregados de send_history para el dashboard de métricas. Excluye los envíos
-// omitidos por dedupe (entry.skipped): no son llamadas reales al cliente.
+// Serie, totales y período anterior salen de send_stats_hourly (agregados). Solo los
+// listados de fallos leen send_history, acotados por el índice parcial de errores.
+const ERROR_DETAIL_SQL = `COALESCE(
+  entry->>'error',
+  entry->'response'->>'error',
+  entry->'response'->>'message',
+  CASE WHEN jsonb_typeof(entry->'response') = 'string' THEN entry->>'response' END,
+  'HTTP ' || COALESCE(status::text, '0'))`;
+
 export async function getSendStats({ hours = 24 } = {}) {
   const bucket = hours <= 48 ? 'hour' : 'day';
-  const notSkipped = `COALESCE((entry->>'skipped')::boolean, false) = false`;
-  const range = `ts >= now() - make_interval(hours => $1)`;
-  const [series, byClient, topErrors, prev] = await Promise.all([
+  const aggFrom = `bucket >= date_trunc('hour', now() - make_interval(hours => $1))`;
+  const rawRange = `ts >= now() - make_interval(hours => $1)`;
+  const [series, byClient, vehicles, prev, topErrors, topErrorTypes, cov] = await Promise.all([
     pool.query(
-      `SELECT date_trunc('${bucket}', ts) AS bucket, client,
-              count(*) FILTER (WHERE accepted)::int                    AS aceptados,
-              count(*) FILTER (WHERE ok AND accepted IS NOT TRUE)::int AS rechazados,
-              count(*) FILTER (WHERE ok IS NOT TRUE)::int              AS errores
-         FROM send_history
-        WHERE ${range} AND ${notSkipped}
+      `SELECT date_trunc('${bucket}', bucket) AS bucket, client,
+              sum(aceptados)::int AS aceptados, sum(rechazados)::int AS rechazados, sum(errores)::int AS errores
+         FROM send_stats_hourly WHERE ${aggFrom}
         GROUP BY 1, 2 ORDER BY 1`,
       [hours]
     ),
     pool.query(
-      `SELECT client,
-              count(*)::int AS total,
-              count(*) FILTER (WHERE accepted)::int                    AS aceptados,
-              count(*) FILTER (WHERE ok AND accepted IS NOT TRUE)::int AS rechazados,
-              count(*) FILTER (WHERE ok IS NOT TRUE)::int              AS errores,
-              count(DISTINCT vehicle_id) FILTER (WHERE accepted)::int  AS vehiculos
-         FROM send_history
-        WHERE ${range} AND ${notSkipped}
+      `SELECT client, sum(total)::int AS total, sum(aceptados)::int AS aceptados,
+              sum(rechazados)::int AS rechazados, sum(errores)::int AS errores
+         FROM send_stats_hourly WHERE ${aggFrom}
         GROUP BY client ORDER BY total DESC`,
+      [hours]
+    ),
+    pool.query(
+      `SELECT client, count(DISTINCT vehicle_id)::int AS vehiculos
+         FROM send_stats_vehicle_hourly WHERE ${aggFrom}
+        GROUP BY client`,
+      [hours]
+    ),
+    pool.query(
+      `SELECT COALESCE(sum(total), 0)::int AS total, COALESCE(sum(aceptados), 0)::int AS aceptados
+         FROM send_stats_hourly
+        WHERE bucket >= date_trunc('hour', now() - make_interval(hours => $1::int * 2))
+          AND bucket <  date_trunc('hour', now() - make_interval(hours => $1))`,
       [hours]
     ),
     pool.query(
       `SELECT vehicle_id, client,
               count(*)::int AS fallos,
               max(ts)       AS ultimo,
-              (array_agg(COALESCE(entry->>'error', entry->'response'->>'error',
-                                  'HTTP ' || COALESCE(status::text, '0')) ORDER BY ts DESC))[1] AS detalle
+              (array_agg(${ERROR_DETAIL_SQL} ORDER BY ts DESC))[1] AS detalle,
+              (array_agg(status ORDER BY ts DESC))[1] AS status
          FROM send_history
-        WHERE ${range} AND ok IS NOT TRUE AND vehicle_id IS NOT NULL
+        WHERE ${rawRange} AND ok IS NOT TRUE AND vehicle_id IS NOT NULL
         GROUP BY vehicle_id, client
         ORDER BY fallos DESC, ultimo DESC
         LIMIT 8`,
       [hours]
     ),
+    // Errores más comunes: mismo mensaje agrupado (los números largos como IMEI se
+    // reemplazan por # para que no se parta por vehículo)
     pool.query(
-      `SELECT count(*)::int AS total,
-              count(*) FILTER (WHERE accepted)::int AS aceptados
-         FROM send_history
-        WHERE ts >= now() - make_interval(hours => $1::int * 2)
-          AND ts <  now() - make_interval(hours => $1)
-          AND ${notSkipped}`,
+      `SELECT client, detalle, status,
+              count(*)::int AS fallos,
+              count(DISTINCT vehicle_id)::int AS vehiculos,
+              max(ts) AS ultimo
+         FROM (
+           SELECT client, vehicle_id, ts, status,
+                  left(regexp_replace(${ERROR_DETAIL_SQL}, '\\d{5,}', '#', 'g'), 160) AS detalle
+             FROM send_history
+            WHERE ${rawRange} AND ok IS NOT TRUE
+         ) s
+        GROUP BY client, detalle, status
+        ORDER BY fallos DESC, ultimo DESC
+        LIMIT 10`,
       [hours]
     ),
+    getStatsCoverage(),
   ]);
+  const vehiculosByClient = new Map(vehicles.rows.map((r) => [r.client, r.vehiculos]));
   return {
     bucket,
     series: series.rows.map((r) => ({ ...r, bucket: r.bucket.toISOString() })),
-    byClient: byClient.rows,
+    byClient: byClient.rows.map((r) => ({ ...r, vehiculos: vehiculosByClient.get(r.client) || 0 })),
     topErrors: topErrors.rows.map((r) => ({ ...r, ultimo: r.ultimo.toISOString() })),
+    topErrorTypes: topErrorTypes.rows.map((r) => ({ ...r, ultimo: r.ultimo.toISOString() })),
     prev: prev.rows[0] || { total: 0, aceptados: 0 },
+    updatedAt: cov.updatedAt ? cov.updatedAt.toISOString() : null,
   };
 }
 
 export async function pruneHistory(days) {
   const r1 = await pool.query(`DELETE FROM send_history WHERE ts < now() - ($1 * interval '1 day')`, [days]);
   const r2 = await pool.query(`DELETE FROM activity_log WHERE ts < now() - ($1 * interval '1 day')`, [days]);
+  await pool.query(`DELETE FROM send_stats_hourly WHERE bucket < now() - ($1 * interval '1 day')`, [days]);
+  await pool.query(`DELETE FROM send_stats_vehicle_hourly WHERE bucket < now() - ($1 * interval '1 day')`, [days]);
   return { removed: (r1.rowCount || 0) + (r2.rowCount || 0) };
 }
 
