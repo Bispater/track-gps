@@ -7,7 +7,7 @@ El stack son **4 contenedores** orquestados desde `track-service/docker-compose.
 | Servicio   | Qué es                            | Imagen / build              |
 |------------|-----------------------------------|-----------------------------|
 | `db`       | Postgres (estado persistente)     | `postgres:16-alpine`        |
-| `backend`  | API Node/Express (`server.js`)    | build de `track-service/`   |
+| `backend`  | API Node/Express (`server.js` + `src/`) | build de `track-service/`   |
 | `frontend` | SPA Angular servido por Nginx     | build de `../track-frontend`|
 | `caddy`    | Reverse proxy + TLS automático    | `caddy:2-alpine`            |
 

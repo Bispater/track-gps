@@ -55,10 +55,10 @@ Parámetros opcionales: `limit` (default 100, máx 1000) y `continuationToken` (
 
 **Carga sobre fm-track.** El refresh de posiciones (cada 10 s) hace una llamada por vehículo con
 ventana de 60 min, de a `FM_TRACK_CONCURRENCY` a la vez. Todos los puntos que llegan se guardan en
-Postgres (`position_history`). El historial del mapa (`GET /api/vehicles/:id/track`, `track-history.js`)
+Postgres (`position_history`). El historial del mapa (`GET /api/vehicles/:id/track`, `src/track-history.js`)
 se sirve desde esa tabla; solo consulta fm-track (paginando con `limit`/`continuationToken`) para
 rellenar, una única vez, tramos anteriores a lo guardado. El análisis (km por GPS y por odómetro
-`calculated_inputs.mileage`, viajes, paradas) está en `track-analysis.js`.
+`calculated_inputs.mileage`, viajes, paradas) está en `src/track-analysis.js`.
 
 **Response**:
 ```json
@@ -261,6 +261,65 @@ FALABELLA_USER_AGENT=gps/1.0.0
 - Para TEST hay que **informar las patentes** al equipo TMS Falabella para que las habiliten antes de probar.
 - Las credenciales de PROD se entregan **solo después** de validar la integración en TEST.
 - Monitorear las transacciones (ok/fallidas) — se recomienda guardar payloads de respuestas 500.
+
+---
+
+# 4. API DESTINO · CVX-R (StartSee · recepción GPS)
+
+Código: `src/integrations/cvxr.js`.
+
+## Base
+- **URL**: `POST https://startsee.cvx-r.cl/api/v1/gps`
+- **Docs**: https://startsee.cvx-r.cl/api/v1/docs/ (la spec OpenAPI está embebida en `swagger-ui-init.js`)
+- **Auth**: `Authorization: Bearer <API key>` (la entrega CVX-R)
+- **Diagnóstico**: `GET` a la misma URL devuelve el último evento que recibieron de este proveedor
+  (en la app: `GET /api/cvxr/ultimo`). En nov-2026 este GET tardaba más de 60 s sin responder.
+
+## Reglas de la doc
+- Body = array de `EventoGPS`, **máx 300 por request**, ordenado del más antiguo al más nuevo.
+- Con contacto encendido, un evento cada **1 min** como máximo; apagado, cada **10 min**.
+- Si el contacto no está conectado, informar `contacto: true` en cada evento.
+
+Por eso el adapter no manda solo la última posición: manda todos los puntos que el equipo
+registró desde el último evento entregado (consulta fm-track desde ese momento, hasta
+`CVXR_BACKFILL_MAX_MIN` atrás). La primera vez manda solo la última. El estado por vehículo
+(último evento entregado, contacto, odómetro al encender) se guarda en `app_meta` (`cvxr_state:<id>`).
+
+## Campos del payload
+
+| Campo | Origen | Notas |
+|---|---|---|
+| `id_evento` | `imei` + epoch en segundos | estable: reenviar el mismo punto da WARN "duplicado" |
+| `patente` | `plate_number` \| `name` | sin guion, máx 10 |
+| `numero_interno` | — | `0` (no usado) |
+| `contratista` / `rut_contratista` | `.env` | se omiten si están vacíos |
+| `fecha_hora_evento` | `datetime` | UTC, `yyyy-MM-ddTHH:mm:ssZ` |
+| `fecha_hora_recepcion` | `datetime` | fm-track no informa cuándo lo recibió |
+| `latitud` / `longitud` / `direccion` / `velocidad` / `altitud` / `satelites` | `position.*` | |
+| `hdop` | `device_inputs.hdop` | se omite si no viene |
+| `contacto` | `ignition_status !== "OFF"` | desconocido → encendido (regla de la doc) |
+| `tipo_evento` | — | `1` si el contacto cambió respecto al evento anterior, si no `0` |
+| `velocidad_maxima` | — | `0` (doc: "0 si no está disponible") |
+| `distancia_recorrida_viaje` | `calculated_inputs.mileage` − odómetro al encender | `0` con contacto apagado |
+| `distancia_recorrida_total` | `calculated_inputs.mileage` | km |
+| `voltaje_bateria_vehiculo` | `device_inputs.power_supply_voltage` / 1000 | mV → V |
+| `codigo_operador_gsm` | `.env` (`CVXR_CODIGO_OPERADOR_GSM`) | opcional |
+| `green_driving`, `green_driving_valor`, `tipo_dato_opcional` | — | `0` |
+| `dato_opcional` | — | `{}` |
+
+No se envían (fm-track no los entrega o no sabemos con qué nombre): `gsm_signal`, `conductor`,
+`rut_conductor`, `voltaje_bateria_gps`. La doc no dice cuáles son obligatorios: el primer envío real
+lo dirá.
+
+## Respuestas
+Un resultado por evento: `{ "evento": "<id_evento>", "resultado": "OK" | "WARN" | "ERROR", "errores": { "<campo>": ["..."] } }`
+
+| Código | Significado | Qué hace el adapter |
+|---|---|---|
+| **200** + `OK` | Registrado | avanza |
+| **200** + `WARN` | Duplicado: ya lo tenían | avanza (cuenta como aceptado) |
+| **400** + `ERROR` | Datos rechazados (ej. `patente: Patente no habilitada`) | registra el error y avanza (reenviarlo daría lo mismo) |
+| **401**, **429**, **5xx**, sin respuesta | Token inválido / límite / falla de ellos | no avanza: se reintenta en el próximo ciclo |
 
 ---
 

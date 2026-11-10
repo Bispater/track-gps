@@ -13,12 +13,13 @@
 // La cache de fm-track (objects/positions/groups) NO se persiste: vive en RAM
 // porque es solo un espejo TTL de la API de fm-track.
 import pg from 'pg';
+import { env } from './config.js';
 
 const { Pool } = pg;
 
 // pg lee DATABASE_URL automáticamente, o las vars PG* (PGHOST, PGUSER, …).
 const pool = new Pool(
-  process.env.DATABASE_URL ? { connectionString: process.env.DATABASE_URL } : {}
+  env.DATABASE_URL ? { connectionString: env.DATABASE_URL } : {}
 );
 
 pool.on('error', (err) => {

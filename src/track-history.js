@@ -13,12 +13,13 @@
 //   - relleno desde fm-track: hasta MAX_PAGES páginas de PAGE_LIMIT puntos (truncated=true si se supera)
 //   - 429 de fm-track: reintenta con espera creciente
 //   - cache en RAM de CACHE_TTL_MS por (vehículo, from, to)
+import { env } from './config.js';
 import { analyzeTrack, normalizePoints } from './track-analysis.js';
 
 const PAGE_LIMIT = 1000;
 const MAX_PAGES = 40;
-const MAX_DAYS = Math.max(1, Number(process.env.TRACK_HISTORY_MAX_DAYS || 7));
-const FALLBACK = String(process.env.TRACK_HISTORY_FALLBACK ?? 'true').toLowerCase() !== 'false';
+const MAX_DAYS = Math.max(1, Number(env.TRACK_HISTORY_MAX_DAYS || 7));
+const FALLBACK = String(env.TRACK_HISTORY_FALLBACK ?? 'true').toLowerCase() !== 'false';
 const CACHE_TTL_MS = 60 * 1000;
 const CACHE_MAX = 100;
 const RETRY_429 = [1500, 3000, 6000];
@@ -26,21 +27,6 @@ const cache = new Map();
 const backfilledFrom = new Map(); // vehicleId → epoch ms: ya se pidió a fm-track desde aquí (evita repetir rangos vacíos)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Ejecuta fn sobre items con a lo más `limit` promesas en vuelo. Misma forma que Promise.allSettled.
-export async function mapLimit(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      try { results[i] = { status: 'fulfilled', value: await fn(items[i], i) }; }
-      catch (reason) { results[i] = { status: 'rejected', reason }; }
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
 
 function parseDate(v) {
   if (!v || typeof v !== 'string') return null;
