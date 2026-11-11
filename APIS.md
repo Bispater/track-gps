@@ -48,14 +48,24 @@ Devuelve array directo de objetos.
 
 ### 1.2 GET `/objects/{objectId}/coordinates?fromDatetime=X&toDatetime=Y` — histórico de posiciones
 Para obtener la última posición se consulta con una ventana de tiempo y se toma el item con `datetime` más reciente.
-**No existe** un endpoint bulk de "last known position".
+Ojo: con más de `limit` puntos en la ventana fm-track devuelve los **más antiguos**, así que una
+ventana larga (24 h / 7 días) puede dar una "última" posición atrasada.
+
+**Último punto de todos los vehículos (bulk)**: `GET /objects-last-coordinate?version=2&limit=200`
+(paginado con `continuation_token`) → `{ results: [{ id, name, imei, vehicle_params, last_coordinate:
+{ latitude, longitude, speed, direction, altitude, satellites_count, datetime, last_valid_gps_datetime,
+server_datetime } }], continuation_token }`. **No** trae `ignition_status`, `device_inputs` ni
+`calculated_inputs`: sirve para saber qué vehículo tiene un punto nuevo, no reemplaza a `/coordinates`.
+`version=3` responde 403 en nuestras cuentas (feature no habilitada).
 
 Parámetros opcionales: `limit` (default 100, máx 1000) y `continuationToken` (viene como
 `continuation_token` en la respuesta cuando hay más registros que `limit`).
 
-**Carga sobre fm-track.** El refresh de posiciones (cada 10 s) hace una llamada por vehículo con
-ventana de 60 min, de a `FM_TRACK_CONCURRENCY` a la vez. Todos los puntos que llegan se guardan en
-Postgres (`position_history`). El historial del mapa (`GET /api/vehicles/:id/track`, `src/track-history.js`)
+**Carga sobre fm-track.** Un solo recolector (`src/fmtrack.js`) consulta fm-track: cada
+`FM_TRACK_POLL_MS` (10 s) pide `/objects-last-coordinate` por cuenta y, solo para los vehículos con un
+punto nuevo, `/coordinates` desde su último punto conocido. Los envíos, `/api/snapshot` y el mapa leen
+de lo que ya trajo (RAM), sin consultar fm-track en cada pedido. `GET /api/fm-track/stats` muestra las
+consultas por minuto. Todos los puntos que llegan se guardan en Postgres (`position_history`). El historial del mapa (`GET /api/vehicles/:id/track`, `src/track-history.js`)
 se sirve desde esa tabla; solo consulta fm-track (paginando con `limit`/`continuationToken`) para
 rellenar, una única vez, tramos anteriores a lo guardado. El análisis (km por GPS y por odómetro
 `calculated_inputs.mileage`, viajes, paradas) está en `src/track-analysis.js`.

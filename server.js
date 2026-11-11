@@ -14,7 +14,7 @@ import { PORT, FM_TRACK_API_KEY, FM_TRACK_API_KEYS } from './src/config.js';
 import express from 'express';
 import * as db from './src/db.js';
 import { registerAuth, logAuthStatus } from './src/auth.js';
-import { callFmTrack, initPositionIndex, resolveApiKey } from './src/fmtrack.js';
+import { callFmTrack, initPositionIndex, startPositionCollector, resolveApiKey } from './src/fmtrack.js';
 import { startMaintenance } from './src/maintenance.js';
 import { registerCoreRoutes } from './src/routes.js';
 import { registerTrackRoutes } from './src/track-history.js';
@@ -25,6 +25,7 @@ import { toArray } from './src/util.js';
 await db.initDb();
 startMaintenance();
 await initPositionIndex();
+startPositionCollector();
 for (const it of integrations) await it.init();
 
 const app = express();

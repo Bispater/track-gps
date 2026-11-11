@@ -3,7 +3,7 @@
 // =============================================================
 import { FM_TRACK_BASE_URL, FM_TRACK_API_KEY, TARGET_API_URL, TARGET_API_KEY, isGroupAllowed } from './config.js';
 import * as db from './db.js';
-import { callFmTrack, ensurePositions, ensureGroupsCache, positionsCache, groupsCache, groupApiKey } from './fmtrack.js';
+import { callFmTrack, ensurePositions, ensureGroupsCache, positionsCache, groupsCache, groupApiKey, getFmTrackStats } from './fmtrack.js';
 import { isStatsReady, getErrorsUntil } from './maintenance.js';
 import { readBody } from './util.js';
 
@@ -35,7 +35,10 @@ export function registerCoreRoutes(app) {
     }
   });
 
-  // Vehículos + últimas posiciones + grupos de todos los tenants
+  // Diagnóstico: consultas a fm-track por minuto (total, por tipo, 429) y estado del recolector
+  app.get('/api/fm-track/stats', (_req, res) => res.json(getFmTrackStats()));
+
+  // Vehículos + últimas posiciones + grupos de todos los tenants (de RAM: no consulta fm-track)
   app.get('/api/snapshot', async (_req, res) => {
     if (!FM_TRACK_API_KEY) return noFmKey(res);
     try {
