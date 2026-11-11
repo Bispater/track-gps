@@ -4,7 +4,7 @@
 import { FM_TRACK_BASE_URL, FM_TRACK_API_KEY, TARGET_API_URL, TARGET_API_KEY, isGroupAllowed } from './config.js';
 import * as db from './db.js';
 import { callFmTrack, ensurePositions, ensureGroupsCache, positionsCache, groupsCache, groupApiKey } from './fmtrack.js';
-import { isStatsReady } from './maintenance.js';
+import { isStatsReady, getErrorsUntil } from './maintenance.js';
 import { readBody } from './util.js';
 
 const noFmKey = (res) => res.status(500).json({ error: 'FM_TRACK_API_KEY no configurada' });
@@ -93,16 +93,19 @@ export function registerCoreRoutes(app) {
   // ---------- métricas (dashboard) ----------
   // Cache corto: la pantalla de Métricas se refresca sola cada 60 s y varios usuarios
   // pueden tenerla abierta; los agregados se recalculan cada minuto de todas formas.
-  const statsCache = new Map(); // hours → { at, body }
+  const statsCache = new Map(); // "horas|cliente" → { at, body }
   const STATS_HOURS = new Set([24, 48, 168]);
   app.get('/api/stats/sends', async (req, res) => {
     try {
       const hoursRaw = Number(req.query.hours) || 24;
       const hours = STATS_HOURS.has(hoursRaw) ? hoursRaw : 24;
-      const hit = statsCache.get(hours);
+      // ?client=<id>: solo ese cliente (sin el parámetro = todos)
+      const client = typeof req.query.client === 'string' && /^[a-z0-9_-]{1,40}$/i.test(req.query.client) ? req.query.client : null;
+      const key = `${hours}|${client || ''}`;
+      const hit = statsCache.get(key);
       if (hit && Date.now() - hit.at < 30 * 1000) return res.json(hit.body);
-      const body = { ...(await db.getSendStats({ hours })), ready: isStatsReady() };
-      statsCache.set(hours, { at: Date.now(), body });
+      const body = { ...(await db.getSendStats({ hours, client, errorsUntil: getErrorsUntil() })), ready: isStatsReady() };
+      statsCache.set(key, { at: Date.now(), body });
       res.json(body);
     } catch (err) { res.status(500).json({ error: String(err) }); }
   });

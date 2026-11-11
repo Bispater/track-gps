@@ -3,6 +3,8 @@
 // =============================================================
 //   - retención: borra historial y posiciones más viejos que los días configurados
 //   - agregados de métricas (send_stats_hourly): se preparan al arrancar y se refrescan cada minuto
+//   - errores agrupados por hora (send_errors_hourly): se llenan al arrancar y se agrega cada
+//     hora que se cierra
 import { RETENTION_DAYS, POSITION_RETENTION_DAYS } from './config.js';
 import * as db from './db.js';
 
@@ -20,6 +22,44 @@ async function pruneAllHistories() {
 let statsReady = false;
 let statsRollupRunning = false;
 export const isStatsReady = () => statsReady;
+
+// Hasta dónde está agrupado send_errors_hourly (inicio de la primera hora sin agrupar).
+// null = todavía no está listo: Métricas lee los errores de send_history como antes.
+let errorsUntil = null;
+let errorsRollupRunning = false;
+export const getErrorsUntil = () => errorsUntil;
+const HOUR = 3600e3;
+const hourStart = (t) => new Date(Math.floor(t / HOUR) * HOUR);
+
+// Agrupa las horas cerradas desde `from` hasta la hora en curso, de a un día por vez para
+// no tener ocupada la base con una sola consulta larga.
+async function rollErrors(from) {
+  const to = hourStart(Date.now());
+  for (let a = from.getTime(); a < to.getTime(); a += 24 * HOUR) {
+    await db.rollupSendErrors(new Date(a), new Date(Math.min(a + 24 * HOUR, to.getTime())));
+  }
+  errorsUntil = to;
+}
+async function prepareErrorStats() {
+  try {
+    const t0 = Date.now();
+    const last = await db.getErrorsCoverage();
+    // Primera vez: todo el período de retención. Reinicios: desde la última hora agrupada.
+    const from = last ? new Date(last) : hourStart(Date.now() - (RETENTION_DAYS * 24 + 24) * HOUR);
+    await rollErrors(from);
+    console.log(`[stats] errores agrupados listos (${Math.round((Date.now() - from.getTime()) / HOUR)} h en ${Math.round((Date.now() - t0) / 1000)} s)`);
+  } catch (err) {
+    console.error('[stats] error agrupando errores de métricas:', String(err));
+  }
+}
+// Cada minuto: si se cerró una hora, se agrupa (rehaciendo también la anterior)
+async function rollErrorsIfHourClosed() {
+  if (!errorsUntil || errorsRollupRunning || hourStart(Date.now()) <= errorsUntil) return;
+  errorsRollupRunning = true;
+  try { await rollErrors(new Date(errorsUntil.getTime() - HOUR)); }
+  catch (err) { console.warn('[stats] errores agrupados:', String(err)); }
+  finally { errorsRollupRunning = false; }
+}
 
 // Se preparan en segundo plano: en una base grande los índices y el primer rollup
 // pueden tardar minutos, y los schedulers no deben esperar.
@@ -50,7 +90,8 @@ export function startMaintenance() {
   setTimeout(() => pruneAllHistories().catch(() => {}), 10 * 1000);
   setInterval(() => pruneAllHistories().catch(() => {}), 24 * 3600 * 1000);
 
-  prepareStats();
+  prepareStats().then(prepareErrorStats);
+  setInterval(rollErrorsIfHourClosed, 60 * 1000);
   setInterval(async () => {
     if (!statsReady || statsRollupRunning) return;
     statsRollupRunning = true;

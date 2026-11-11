@@ -78,6 +78,23 @@ CREATE TABLE IF NOT EXISTS send_stats_vehicle_hourly (
   vehicle_id TEXT        NOT NULL,
   PRIMARY KEY (bucket, client, vehicle_id)
 );
+-- Errores agrupados por hora cerrada (cliente, vehículo, código, mensaje) para las tarjetas
+-- "Errores más comunes" y "Vehículos con fallos". Antes se leían de send_history: con
+-- 7 días eran ~200 mil filas con su JSON completo y cada carga tardaba ~30 s.
+-- detalle = mensaje normalizado (números largos → #); ultimo_detalle = mensaje completo
+-- del error más reciente del grupo. Los mantiene rollupSendErrors().
+CREATE TABLE IF NOT EXISTS send_errors_hourly (
+  bucket         TIMESTAMPTZ NOT NULL,
+  client         TEXT        NOT NULL,
+  vehicle_id     TEXT,
+  status         INTEGER,
+  detalle        TEXT        NOT NULL,
+  fallos         INTEGER     NOT NULL,
+  ultimo         TIMESTAMPTZ NOT NULL,
+  ultimo_detalle TEXT        NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_send_errors_hourly_bucket ON send_errors_hourly (bucket);
+CREATE INDEX IF NOT EXISTS idx_send_errors_hourly_client ON send_errors_hourly (client, bucket);
 -- Marcas de mantenimiento (ej: backfill ya ejecutado)
 CREATE TABLE IF NOT EXISTS app_meta (
   key   TEXT PRIMARY KEY,
@@ -237,6 +254,35 @@ export async function rollupSendStats({ sinceHours = 2 } = {}) {
      ON CONFLICT DO NOTHING`,
     [sinceHours]
   );
+}
+// Recalcula los errores agrupados de las horas cerradas en [from, to) (borra y vuelve a
+// insertar en una transacción: quien lee ve la versión anterior o la nueva, nunca a medias).
+export async function rollupSendErrors(from, to) {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query('DELETE FROM send_errors_hourly WHERE bucket >= $1 AND bucket < $2', [from, to]);
+    await c.query(
+      `INSERT INTO send_errors_hourly (bucket, client, vehicle_id, status, detalle, fallos, ultimo, ultimo_detalle)
+       SELECT date_trunc('hour', ts), client, vehicle_id, status, ${ERROR_NORM_SQL('det')},
+              count(*)::int, max(ts), (array_agg(det ORDER BY ts DESC))[1]
+         FROM (SELECT ts, client, vehicle_id, status, ${ERROR_DETAIL_SQL} AS det
+                 FROM send_history WHERE ts >= $1 AND ts < $2 AND ok IS NOT TRUE) s
+        GROUP BY 1, 2, 3, 4, 5`,
+      [from, to]
+    );
+    await c.query('COMMIT');
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    c.release();
+  }
+}
+// Última hora agrupada (null = tabla vacía)
+export async function getErrorsCoverage() {
+  const { rows } = await pool.query('SELECT max(bucket) AS last_bucket FROM send_errors_hourly');
+  return rows[0]?.last_bucket || null;
 }
 export async function getStatsCoverage() {
   const { rows } = await pool.query('SELECT max(bucket) AS last_bucket, max(updated_at) AS updated_at, count(*)::int AS n FROM send_stats_hourly');
@@ -410,77 +456,85 @@ export async function prunePositions(days) {
 
 // ---------- retención ----------
 // ---------- métricas ----------
-// Serie, totales y período anterior salen de send_stats_hourly (agregados). Solo los
-// listados de fallos leen send_history, acotados por el índice parcial de errores.
+// Serie, totales y período anterior salen de send_stats_hourly (agregados). Los listados
+// de fallos salen de send_errors_hourly (horas cerradas) más send_history solo para los
+// bordes del rango (la primera hora parcial y lo que aún no se agrupó), acotado por el
+// índice parcial de errores. Sin send_errors_hourly listo, todo sale de send_history.
 const ERROR_DETAIL_SQL = `COALESCE(
   entry->>'error',
   entry->'response'->>'error',
   entry->'response'->>'message',
   CASE WHEN jsonb_typeof(entry->'response') = 'string' THEN entry->>'response' END,
   'HTTP ' || COALESCE(status::text, '0'))`;
+// Mismo mensaje agrupado: los números largos como IMEI se reemplazan por # para que no se
+// parta por vehículo
+const ERROR_NORM_SQL = (col) => `left(regexp_replace(${col}, '\\d{5,}', '#', 'g'), 160)`;
 
-export async function getSendStats({ hours = 24 } = {}) {
+// client: solo ese cliente (null = todos). errorsUntil: hasta dónde está agrupado
+// send_errors_hourly (null = no está listo).
+export async function getSendStats({ hours = 24, client = null, errorsUntil = null } = {}) {
   const bucket = hours <= 48 ? 'hour' : 'day';
   const aggFrom = `bucket >= date_trunc('hour', now() - make_interval(hours => $1))`;
   const rawRange = `ts >= now() - make_interval(hours => $1)`;
+  // $1 = horas, $2 = cliente (o null = todos)
+  const byC = `($2::text IS NULL OR client = $2)`;
+  const p = [hours, client];
   const [series, byClient, vehicles, prev, topErrors, topErrorTypes, cov] = await Promise.all([
     pool.query(
       `SELECT date_trunc('${bucket}', bucket) AS bucket, client,
               sum(aceptados)::int AS aceptados, sum(rechazados)::int AS rechazados, sum(errores)::int AS errores
-         FROM send_stats_hourly WHERE ${aggFrom}
+         FROM send_stats_hourly WHERE ${aggFrom} AND ${byC}
         GROUP BY 1, 2 ORDER BY 1`,
-      [hours]
+      p
     ),
     pool.query(
       `SELECT client, sum(total)::int AS total, sum(aceptados)::int AS aceptados,
               sum(rechazados)::int AS rechazados, sum(errores)::int AS errores
-         FROM send_stats_hourly WHERE ${aggFrom}
+         FROM send_stats_hourly WHERE ${aggFrom} AND ${byC}
         GROUP BY client ORDER BY total DESC`,
-      [hours]
+      p
     ),
     pool.query(
       `SELECT client, count(DISTINCT vehicle_id)::int AS vehiculos
-         FROM send_stats_vehicle_hourly WHERE ${aggFrom}
+         FROM send_stats_vehicle_hourly WHERE ${aggFrom} AND ${byC}
         GROUP BY client`,
-      [hours]
+      p
     ),
     pool.query(
       `SELECT COALESCE(sum(total), 0)::int AS total, COALESCE(sum(aceptados), 0)::int AS aceptados
          FROM send_stats_hourly
         WHERE bucket >= date_trunc('hour', now() - make_interval(hours => $1::int * 2))
-          AND bucket <  date_trunc('hour', now() - make_interval(hours => $1))`,
-      [hours]
+          AND bucket <  date_trunc('hour', now() - make_interval(hours => $1))
+          AND ${byC}`,
+      p
     ),
-    pool.query(
+    errorsUntil ? topErrorsFromAgg(hours, client, errorsUntil) : pool.query(
       `SELECT vehicle_id, client,
               count(*)::int AS fallos,
               max(ts)       AS ultimo,
               (array_agg(${ERROR_DETAIL_SQL} ORDER BY ts DESC))[1] AS detalle,
               (array_agg(status ORDER BY ts DESC))[1] AS status
          FROM send_history
-        WHERE ${rawRange} AND ok IS NOT TRUE AND vehicle_id IS NOT NULL
+        WHERE ${rawRange} AND ok IS NOT TRUE AND vehicle_id IS NOT NULL AND ${byC}
         GROUP BY vehicle_id, client
         ORDER BY fallos DESC, ultimo DESC
         LIMIT 8`,
-      [hours]
+      p
     ),
-    // Errores más comunes: mismo mensaje agrupado (los números largos como IMEI se
-    // reemplazan por # para que no se parta por vehículo)
-    pool.query(
+    errorsUntil ? topErrorTypesFromAgg(hours, client, errorsUntil) : pool.query(
       `SELECT client, detalle, status,
               count(*)::int AS fallos,
               count(DISTINCT vehicle_id)::int AS vehiculos,
               max(ts) AS ultimo
          FROM (
-           SELECT client, vehicle_id, ts, status,
-                  left(regexp_replace(${ERROR_DETAIL_SQL}, '\\d{5,}', '#', 'g'), 160) AS detalle
+           SELECT client, vehicle_id, ts, status, ${ERROR_NORM_SQL(ERROR_DETAIL_SQL)} AS detalle
              FROM send_history
-            WHERE ${rawRange} AND ok IS NOT TRUE
+            WHERE ${rawRange} AND ok IS NOT TRUE AND ${byC}
          ) s
         GROUP BY client, detalle, status
         ORDER BY fallos DESC, ultimo DESC
         LIMIT 10`,
-      [hours]
+      p
     ),
     getStatsCoverage(),
   ]);
@@ -496,11 +550,66 @@ export async function getSendStats({ hours = 24 } = {}) {
   };
 }
 
+// Errores del rango [now() - horas, now()] como filas agrupadas (cliente, vehículo, código,
+// mensaje): horas cerradas ya agrupadas en [h0, $3) + send_history para la primera hora
+// parcial [now() - horas, h0) y para lo que aún no se agrupó (desde $3).
+// $1 = horas, $2 = cliente (o null), $3 = hasta dónde está agrupado.
+const ERRORS_CTE = (() => {
+  const h0 = `(date_trunc('hour', now() - make_interval(hours => $1)) + interval '1 hour')`;
+  const byC = `($2::text IS NULL OR client = $2)`;
+  return `WITH raw AS (
+    SELECT client, vehicle_id, status, ts, ${ERROR_DETAIL_SQL} AS det
+      FROM send_history
+     WHERE ok IS NOT TRUE AND ts >= now() - make_interval(hours => $1) AND ts < ${h0} AND ${byC}
+    UNION ALL
+    SELECT client, vehicle_id, status, ts, ${ERROR_DETAIL_SQL} AS det
+      FROM send_history
+     WHERE ok IS NOT TRUE AND ts >= GREATEST($3::timestamptz, ${h0}) AND ${byC}
+  ), err AS (
+    SELECT client, vehicle_id, status, detalle, fallos, ultimo, ultimo_detalle
+      FROM send_errors_hourly
+     WHERE bucket >= ${h0} AND bucket < $3::timestamptz AND ${byC}
+    UNION ALL
+    SELECT client, vehicle_id, status, ${ERROR_NORM_SQL('det')}, count(*)::int, max(ts), (array_agg(det ORDER BY ts DESC))[1]
+      FROM raw GROUP BY 1, 2, 3, 4
+  )`;
+})();
+function topErrorsFromAgg(hours, client, errorsUntil) {
+  return pool.query(
+    `${ERRORS_CTE}
+     SELECT vehicle_id, client,
+            sum(fallos)::int AS fallos,
+            max(ultimo)      AS ultimo,
+            (array_agg(ultimo_detalle ORDER BY ultimo DESC))[1] AS detalle,
+            (array_agg(status ORDER BY ultimo DESC))[1] AS status
+       FROM err WHERE vehicle_id IS NOT NULL
+      GROUP BY vehicle_id, client
+      ORDER BY fallos DESC, ultimo DESC
+      LIMIT 8`,
+    [hours, client, errorsUntil]
+  );
+}
+function topErrorTypesFromAgg(hours, client, errorsUntil) {
+  return pool.query(
+    `${ERRORS_CTE}
+     SELECT client, detalle, status,
+            sum(fallos)::int AS fallos,
+            count(DISTINCT vehicle_id)::int AS vehiculos,
+            max(ultimo) AS ultimo
+       FROM err
+      GROUP BY client, detalle, status
+      ORDER BY fallos DESC, ultimo DESC
+      LIMIT 10`,
+    [hours, client, errorsUntil]
+  );
+}
+
 export async function pruneHistory(days) {
   const r1 = await pool.query(`DELETE FROM send_history WHERE ts < now() - ($1 * interval '1 day')`, [days]);
   const r2 = await pool.query(`DELETE FROM activity_log WHERE ts < now() - ($1 * interval '1 day')`, [days]);
   await pool.query(`DELETE FROM send_stats_hourly WHERE bucket < now() - ($1 * interval '1 day')`, [days]);
   await pool.query(`DELETE FROM send_stats_vehicle_hourly WHERE bucket < now() - ($1 * interval '1 day')`, [days]);
+  await pool.query(`DELETE FROM send_errors_hourly WHERE bucket < now() - ($1 * interval '1 day')`, [days]);
   return { removed: (r1.rowCount || 0) + (r2.rowCount || 0) };
 }
 
