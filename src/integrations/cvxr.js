@@ -23,16 +23,23 @@ import { defineIntegration, eachVehicle } from './base.js';
 const {
   CVXR_API_URL = 'https://startsee.cvx-r.cl/api/v1/gps',
   CVXR_GROUPS = '',
-  // Empresa contratista/transportista dueña de los vehículos (no viene en fm-track).
-  // Si están vacíos, los eventos van sin esos campos.
+  // Datos que fm-track no entrega y CVX-R exige (respuesta del primer envío real,
+  // 2026-11-11). Si están vacíos el campo no se envía y CVX-R rechaza el evento.
+  // Empresa contratista/transportista dueña de los vehículos
   CVXR_CONTRATISTA = '',
   CVXR_RUT_CONTRATISTA = '',
-  // Código MCC-MNC de las SIM de los equipos (ej. 73001 Entel, 73002 Movistar). Opcional.
+  // Conductor (fm-track no lo identifica)
+  CVXR_CONDUCTOR = '',
+  CVXR_RUT_CONDUCTOR = '',
+  // Código MCC-MNC de las SIM de los equipos (ej. 73001 Entel, 73002 Movistar)
   CVXR_CODIGO_OPERADOR_GSM = '',
   CVXR_BACKFILL_MAX_MIN = '120',
 } = env;
 const TOKEN = (env.CVXR_API_TOKEN || '').trim();
-const RUT_CONTRATISTA = String(CVXR_RUT_CONTRATISTA).replace(/[^0-9kK]/g, '').toUpperCase();
+// RUT con dígito verificador, sin puntos ni guion
+const cleanRut = (s) => String(s).replace(/[^0-9kK]/g, '').toUpperCase();
+const RUT_CONTRATISTA = cleanRut(CVXR_RUT_CONTRATISTA);
+const RUT_CONDUCTOR = cleanRut(CVXR_RUT_CONDUCTOR);
 
 const MAX_PER_REQUEST = 300;
 const BACKFILL_MAX_MS = Math.max(1, Number(CVXR_BACKFILL_MAX_MIN) || 120) * 60 * 1000;
@@ -132,14 +139,19 @@ function buildEvents(obj, vehicleId, points, startState) {
       velocidad_maxima: 0, // doc: 0 si no está disponible
       altitud: clampInt(pick(pos, ['position.altitude']), -1000, 10000, 0),
       satelites: clampInt(pick(pos, ['position.satellites_count']), 0, 100, 0),
-      ...(hdop != null ? { hdop } : {}),
+      hdop: hdop ?? 0, // obligatorio para CVX-R; 0 si el equipo no lo informa
       contacto: on,
       tipo_evento: changed ? 1 : 0, // 0 = por intervalo, 1 = ignición on/off
       ...(CVXR_CODIGO_OPERADOR_GSM ? { codigo_operador_gsm: String(CVXR_CODIGO_OPERADOR_GSM) } : {}),
+      gsm_signal: 0, // obligatorio (0-5); fm-track no lo informa
       ...(imei ? { imei } : {}),
       distancia_recorrida_viaje: on && km != null && tripStartKm != null ? round(Math.max(0, km - tripStartKm), 1) : 0,
       ...(km != null ? { distancia_recorrida_total: round(km, 1) } : {}),
-      ...(mv != null && mv > 0 ? { voltaje_bateria_vehiculo: round(mv / 1000, 2) } : {}), // mV → V
+      ...(CVXR_CONDUCTOR ? { conductor: CVXR_CONDUCTOR.slice(0, 100) } : {}),
+      ...(RUT_CONDUCTOR ? { rut_conductor: RUT_CONDUCTOR } : {}),
+      // obligatorios; 0 si no vienen (fm-track no informa la batería interna del GPS)
+      voltaje_bateria_vehiculo: mv != null && mv > 0 ? round(mv / 1000, 2) : 0, // mV → V
+      voltaje_bateria_gps: 0,
       green_driving: 0,
       green_driving_valor: 0,
       tipo_dato_opcional: 0,
@@ -273,6 +285,8 @@ const cvxr = defineIntegration({
     tokenConfigured: Boolean(TOKEN),
     contratista: CVXR_CONTRATISTA || null,
     rutContratista: RUT_CONTRATISTA || null,
+    conductor: CVXR_CONDUCTOR || null,
+    rutConductor: RUT_CONDUCTOR || null,
     codigoOperadorGsm: CVXR_CODIGO_OPERADOR_GSM || null,
     backfillMaxMin: BACKFILL_MAX_MS / 60000,
   }),
@@ -296,7 +310,8 @@ const cvxr = defineIntegration({
   },
   warnings: () => [
     ...(TOKEN ? [] : ['CVXR_API_TOKEN no configurado']),
-    ...(CVXR_CONTRATISTA && RUT_CONTRATISTA ? [] : ['CVX-R: CVXR_CONTRATISTA / CVXR_RUT_CONTRATISTA vacíos (los eventos van sin contratista)']),
+    ...(CVXR_CONTRATISTA && RUT_CONTRATISTA && CVXR_CONDUCTOR && RUT_CONDUCTOR && CVXR_CODIGO_OPERADOR_GSM ? []
+      : ['CVX-R: faltan CVXR_CONTRATISTA / CVXR_RUT_CONTRATISTA / CVXR_CONDUCTOR / CVXR_RUT_CONDUCTOR / CVXR_CODIGO_OPERADOR_GSM (CVX-R los exige)']),
   ],
 });
 

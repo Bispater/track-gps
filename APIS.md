@@ -292,24 +292,28 @@ registró desde el último evento entregado (consulta fm-track desde ese momento
 | `id_evento` | `imei` + epoch en segundos | estable: reenviar el mismo punto da WARN "duplicado" |
 | `patente` | `plate_number` \| `name` | sin guion, máx 10 |
 | `numero_interno` | — | `0` (no usado) |
-| `contratista` / `rut_contratista` | `.env` | se omiten si están vacíos |
+| `contratista` / `rut_contratista` | `.env` | obligatorios para CVX-R |
 | `fecha_hora_evento` | `datetime` | UTC, `yyyy-MM-ddTHH:mm:ssZ` |
 | `fecha_hora_recepcion` | `datetime` | fm-track no informa cuándo lo recibió |
 | `latitud` / `longitud` / `direccion` / `velocidad` / `altitud` / `satelites` | `position.*` | |
-| `hdop` | `device_inputs.hdop` | se omite si no viene |
+| `hdop` | `device_inputs.hdop` | `0` si no viene |
 | `contacto` | `ignition_status !== "OFF"` | desconocido → encendido (regla de la doc) |
 | `tipo_evento` | — | `1` si el contacto cambió respecto al evento anterior, si no `0` |
 | `velocidad_maxima` | — | `0` (doc: "0 si no está disponible") |
 | `distancia_recorrida_viaje` | `calculated_inputs.mileage` − odómetro al encender | `0` con contacto apagado |
 | `distancia_recorrida_total` | `calculated_inputs.mileage` | km |
-| `voltaje_bateria_vehiculo` | `device_inputs.power_supply_voltage` / 1000 | mV → V |
-| `codigo_operador_gsm` | `.env` (`CVXR_CODIGO_OPERADOR_GSM`) | opcional |
+| `voltaje_bateria_vehiculo` | `device_inputs.power_supply_voltage` / 1000 | mV → V; `0` si no viene |
+| `voltaje_bateria_gps` | — | `0` (fm-track no lo informa) |
+| `gsm_signal` | — | `0` (fm-track no lo informa) |
+| `conductor` / `rut_conductor` | `.env` (`CVXR_CONDUCTOR`, `CVXR_RUT_CONDUCTOR`) | obligatorios para CVX-R |
+| `codigo_operador_gsm` | `.env` (`CVXR_CODIGO_OPERADOR_GSM`) | obligatorio para CVX-R |
 | `green_driving`, `green_driving_valor`, `tipo_dato_opcional` | — | `0` |
 | `dato_opcional` | — | `{}` |
 
-No se envían (fm-track no los entrega o no sabemos con qué nombre): `gsm_signal`, `conductor`,
-`rut_conductor`, `voltaje_bateria_gps`. La doc no dice cuáles son obligatorios: el primer envío real
-lo dirá.
+La doc no marca obligatorios, pero el primer envío real (2026-11-11) respondió 400 exigiendo
+`contratista`, `rut_contratista`, `hdop`, `codigo_operador_gsm`, `gsm_signal`, `conductor`,
+`rut_conductor`, `voltaje_bateria_vehiculo` y `voltaje_bateria_gps`. Los numéricos que fm-track no
+entrega van en `0`; los de texto salen del `.env` y, si están vacíos, CVX-R rechaza el evento.
 
 ## Respuestas
 Un resultado por evento: `{ "evento": "<id_evento>", "resultado": "OK" | "WARN" | "ERROR", "errores": { "<campo>": ["..."] } }`
