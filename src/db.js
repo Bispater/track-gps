@@ -140,6 +140,27 @@ CREATE TABLE IF NOT EXISTS last_sent (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (client, vehicle_id)
 );
+
+-- Accesos API (src/api-externa.js): credenciales de solo lectura para que un cliente
+-- consulte la última posición de las patentes autorizadas. El token se guarda como hash
+-- SHA-256 (se muestra una sola vez); token_fin = últimos 4 caracteres para reconocerlo.
+CREATE TABLE IF NOT EXISTS api_access (
+  id            BIGSERIAL   PRIMARY KEY,
+  nombre        TEXT        NOT NULL,
+  usuario       TEXT        NOT NULL UNIQUE,
+  token_hash    TEXT        NOT NULL UNIQUE,
+  token_fin     TEXT        NOT NULL,
+  patentes      TEXT[]      NOT NULL DEFAULT '{}',
+  limite_minuto INTEGER     NOT NULL DEFAULT 2,
+  enabled       BOOLEAN     NOT NULL DEFAULT true,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by    TEXT,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ,
+  last_ip       TEXT,
+  consultas     BIGINT      NOT NULL DEFAULT 0,
+  limitadas     BIGINT      NOT NULL DEFAULT 0
+);
 `;
 
 // Espera a que Postgres esté disponible (en Docker el backend arranca antes que la DB
@@ -390,6 +411,57 @@ export async function saveLastSent(client, vehicleId, datetime) {
      VALUES ($1, $2, $3, now())
      ON CONFLICT (client, vehicle_id) DO UPDATE SET datetime = EXCLUDED.datetime, updated_at = now()`,
     [client, String(vehicleId), datetime ?? null]
+  );
+}
+
+// ---------- api_access (Accesos API) ----------
+const API_ACCESS_COLS = `id, nombre, usuario, token_hash, token_fin, patentes, limite_minuto, enabled,
+  created_at, created_by, updated_at, last_used_at, last_ip, consultas, limitadas`;
+export async function listApiAccess() {
+  const { rows } = await pool.query(`SELECT ${API_ACCESS_COLS} FROM api_access ORDER BY created_at`);
+  return rows;
+}
+export async function insertApiAccess({ nombre, usuario, tokenHash, tokenFin, patentes, limiteMinuto, createdBy }) {
+  const { rows } = await pool.query(
+    `INSERT INTO api_access (nombre, usuario, token_hash, token_fin, patentes, limite_minuto, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${API_ACCESS_COLS}`,
+    [nombre, usuario, tokenHash, tokenFin, patentes, limiteMinuto, createdBy ?? null]
+  );
+  return rows[0];
+}
+// Solo cambia los campos presentes en `c` (nombre, patentes, limiteMinuto, enabled)
+export async function updateApiAccess(id, c) {
+  const { rows } = await pool.query(
+    `UPDATE api_access SET
+       nombre = COALESCE($2, nombre),
+       patentes = COALESCE($3, patentes),
+       limite_minuto = COALESCE($4, limite_minuto),
+       enabled = COALESCE($5, enabled),
+       updated_at = now()
+     WHERE id = $1 RETURNING ${API_ACCESS_COLS}`,
+    [id, c.nombre ?? null, c.patentes ?? null, c.limiteMinuto ?? null, c.enabled ?? null]
+  );
+  return rows[0] || null;
+}
+export async function setApiAccessToken(id, tokenHash, tokenFin) {
+  const { rows } = await pool.query(
+    `UPDATE api_access SET token_hash = $2, token_fin = $3, updated_at = now()
+     WHERE id = $1 RETURNING ${API_ACCESS_COLS}`,
+    [id, tokenHash, tokenFin]
+  );
+  return rows[0] || null;
+}
+export async function deleteApiAccess(id) {
+  const { rowCount } = await pool.query('DELETE FROM api_access WHERE id = $1', [id]);
+  return rowCount > 0;
+}
+// Uso: consulta respondida (limited=false) o rechazada por exceder el límite (limited=true)
+export async function recordApiAccessUse(id, ip, limited) {
+  await pool.query(
+    limited
+      ? 'UPDATE api_access SET limitadas = limitadas + 1 WHERE id = $1'
+      : 'UPDATE api_access SET consultas = consultas + 1, last_used_at = now(), last_ip = $2 WHERE id = $1',
+    limited ? [id] : [id, ip ?? null]
   );
 }
 

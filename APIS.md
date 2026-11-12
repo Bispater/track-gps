@@ -337,6 +337,62 @@ Un resultado por evento: `{ "evento": "<id_evento>", "resultado": "OK" | "WARN" 
 
 ---
 
+# 5. API PROPIA (salida) · Accesos API — solo lectura para clientes
+
+Al revés que los destinos: aquí el **cliente nos consulta** a nosotros. Cada acceso (panel → *Accesos API*)
+tiene usuario, token y la lista de patentes que puede ver. Código: `src/api-externa.js`; tabla `api_access`.
+
+## Endpoint
+```
+GET https://proaseg.cl/api/externo/v1/posiciones
+GET https://proaseg.cl/api/externo/v1/posiciones?patente=AB1234,CD5678   (solo esas; las no autorizadas se ignoran)
+```
+Caddy ya enruta `/api/*` al backend: no hubo que tocar Caddy. La ruta se registra **antes** del login del
+panel (autentica con su propio token; la cookie del panel no sirve aquí y el token no sirve en el panel).
+
+## Autenticación (cualquiera)
+- `Authorization: Bearer <token>`
+- `Authorization: Basic base64(usuario:token)` (usuario y contraseña; la contraseña es el token)
+- `X-API-Key: <token>`
+
+Token `psg_` + 32 caracteres aleatorios. Se guarda solo su SHA-256 y se muestra una vez (al crear o
+regenerar). Regenerar o eliminar invalida el anterior al instante.
+
+## Respuesta
+```json
+{
+  "fecha_consulta": "2026-11-11T12:45:00-03:00",
+  "total": 1,
+  "vehiculos": [
+    { "patente": "AB1234", "latitud": -33.4489, "longitud": -70.6693,
+      "fecha_hora": "2026-11-11T12:42:10-03:00", "velocidad": 54, "ignicion": true }
+  ]
+}
+```
+| Campo | Origen fm-track | Nota |
+|---|---|---|
+| `patente` | `vehicle_params.plate_number` \| `name` | sin guion (misma regla que los envíos) |
+| `latitud` / `longitud` | `position.latitude` / `.longitude` | |
+| `fecha_hora` | `datetime` | ISO 8601 en hora de Chile con offset (`America/Santiago`) |
+| `velocidad` | `position.speed` | km/h, entero |
+| `ignicion` | `ignition_status` | `ON` → true, `OFF` → false, otro → null |
+
+Una patente autorizada sin punto de los últimos 7 días (o que no existe en fm-track) va con los datos en `null`.
+
+## Datos y límites
+- Lee lo que el recolector de fm-track ya tiene en RAM (se actualiza cada ~10 s): **no genera consultas a fm-track**.
+- Medido en prod (2026-11-11): con motor encendido los equipos reportan cada ~30 s (mediana); apagados, cada ~4–5 min.
+- Límite por acceso: `limite_minuto` consultas por ventana móvil de 60 s (por defecto 2, editable 1–60).
+  Sobre eso: **429** + `Retry-After`. Otros errores: **401** credenciales inválidas, **403** acceso desactivado.
+- Uso: `consultas`, `limitadas`, `last_used_at`, `last_ip` por acceso; altas/cambios/bajas en `activity_log` (`kind = 'api_access'`).
+
+## Rutas del panel (exigen sesión)
+`GET /api/accesos` · `POST /api/accesos` (devuelve el token) · `PUT /api/accesos/:id` ·
+`POST /api/accesos/:id/token` (regenera) · `DELETE /api/accesos/:id` · `GET /api/accesos/:id/preview` ·
+`GET /api/accesos/vehiculos` (patentes que reconoce el backend).
+
+---
+
 # Mapeo resumido fm-track → destinos
 
 | fm-track | Q Analytics | Falabella |

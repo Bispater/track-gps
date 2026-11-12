@@ -425,6 +425,21 @@ export async function getPositionsForId(vehicleId) {
   return { obj, pos };
 }
 
+// Todos los vehículos (de todos los tenants) con su último punto, de RAM: no consulta
+// fm-track. pos = null si no tiene un punto de los últimos 7 días. Lo usa la API externa.
+export function getLatestPositions() {
+  const minTs = Date.now() - MAX_POSITION_AGE_MS;
+  const out = [];
+  for (const t of tenants.values()) {
+    for (const o of t.objects) {
+      const id = String(objectId(o));
+      const p = latestById.get(id);
+      out.push({ id, obj: o, pos: p && pointTs(p) >= minTs ? p : null });
+    }
+  }
+  return out;
+}
+
 // Tenant fm-track del vehículo; si aún no hay índice, espera la primera carga.
 export async function resolveApiKey(vehicleId) {
   if (!vehicleKeyIndex.has(String(vehicleId))) await ensurePositions();
