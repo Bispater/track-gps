@@ -161,6 +161,27 @@ CREATE TABLE IF NOT EXISTS api_access (
   consultas     BIGINT      NOT NULL DEFAULT 0,
   limitadas     BIGINT      NOT NULL DEFAULT 0
 );
+
+-- Registro de consultas a la API externa, respondidas y rechazadas. access_id NULL = no se
+-- pudo identificar el acceso (token desconocido o sin credenciales). Se purga a los 90 días.
+CREATE TABLE IF NOT EXISTS api_access_log (
+  id           BIGSERIAL   PRIMARY KEY,
+  ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  access_id    BIGINT      REFERENCES api_access(id) ON DELETE CASCADE,
+  usuario      TEXT,
+  ip           TEXT,
+  metodo       TEXT,
+  status       SMALLINT    NOT NULL,
+  resultado    TEXT        NOT NULL,
+  vehiculos    INTEGER,
+  con_posicion INTEGER,
+  filtro       TEXT,
+  token_fin    TEXT,
+  user_agent   TEXT,
+  ms           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_api_access_log_access ON api_access_log (access_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_api_access_log_ts ON api_access_log (ts);
 `;
 
 // Espera a que Postgres esté disponible (en Docker el backend arranca antes que la DB
@@ -463,6 +484,49 @@ export async function recordApiAccessUse(id, ip, limited) {
       : 'UPDATE api_access SET consultas = consultas + 1, last_used_at = now(), last_ip = $2 WHERE id = $1',
     limited ? [id] : [id, ip ?? null]
   );
+}
+
+// ---------- api_access_log (registro de consultas de la API externa) ----------
+export async function insertApiAccessLog(e) {
+  await pool.query(
+    `INSERT INTO api_access_log (access_id, usuario, ip, metodo, status, resultado, vehiculos, con_posicion, filtro, token_fin, user_agent, ms)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [e.accessId ?? null, e.usuario ?? null, e.ip ?? null, e.metodo ?? null, e.status, e.resultado,
+      e.vehiculos ?? null, e.conPosicion ?? null, e.filtro ?? null, e.tokenFin ?? null, e.userAgent ?? null, e.ms ?? null]
+  );
+}
+// accessId = null → intentos sin acceso identificado
+export async function listApiAccessLog({ accessId = null, onlyErrors = false, sinceHours = null, limit = 100 } = {}) {
+  const params = [];
+  const where = [];
+  if (accessId == null) where.push('access_id IS NULL');
+  else { params.push(accessId); where.push(`access_id = $${params.length}`); }
+  if (onlyErrors) where.push('status >= 400');
+  if (sinceHours) { params.push(sinceHours); where.push(`ts > now() - ($${params.length} * interval '1 hour')`); }
+  params.push(limit);
+  const { rows } = await pool.query(
+    `SELECT id, ts, access_id, usuario, ip, metodo, status, resultado, vehiculos, con_posicion, filtro, token_fin, user_agent, ms
+       FROM api_access_log WHERE ${where.join(' AND ')} ORDER BY ts DESC, id DESC LIMIT $${params.length}`,
+    params
+  );
+  return rows;
+}
+// Por acceso (access_id NULL = sin identificar): respondidas, rechazadas y último rechazo
+export async function apiAccessLogSummary(hours) {
+  const { rows } = await pool.query(
+    `SELECT access_id,
+            count(*) FILTER (WHERE status < 400)::int  AS ok,
+            count(*) FILTER (WHERE status >= 400)::int AS errores,
+            max(ts) FILTER (WHERE status >= 400)       AS ultimo_error
+       FROM api_access_log WHERE ts > now() - ($1 * interval '1 hour')
+      GROUP BY access_id`,
+    [hours]
+  );
+  return rows;
+}
+export async function pruneApiAccessLog(days) {
+  const r = await pool.query(`DELETE FROM api_access_log WHERE ts < now() - ($1 * interval '1 day')`, [days]);
+  return r.rowCount || 0;
 }
 
 // ---------- position_history ----------

@@ -385,10 +385,17 @@ Una patente autorizada sin punto de los últimos 7 días (o que no existe en fm-
 - Límite por acceso: `limite_minuto` consultas por ventana móvil de 60 s (por defecto 2, editable 1–60).
   Sobre eso: **429** + `Retry-After`. Otros errores: **401** credenciales inválidas, **403** acceso desactivado.
 - Uso: `consultas`, `limitadas`, `last_used_at`, `last_ip` por acceso; altas/cambios/bajas en `activity_log` (`kind = 'api_access'`).
+- Registro (`api_access_log`, 90 días): cada consulta respondida o rechazada con fecha, IP, método, status,
+  `resultado` (`ok`, `limite`, `desactivado`, `token_invalido`, `usuario_desconocido`, `sin_credenciales`, `error`),
+  vehículos entregados / con posición, filtro, user-agent y ms. Un rechazo con Basic y un usuario que existe queda en
+  ese acceso, con los últimos 4 caracteres del token usado (para ver si usa uno regenerado). Sin acceso identificable →
+  `access_id` NULL. Tope: 30 filas por acceso y 10 por IP sin identificar por minuto (lo demás se responde igual).
 
 ## Rutas del panel (exigen sesión)
-`GET /api/accesos` · `POST /api/accesos` (devuelve el token) · `PUT /api/accesos/:id` ·
-`POST /api/accesos/:id/token` (regenera) · `DELETE /api/accesos/:id` · `GET /api/accesos/:id/preview` ·
+`GET /api/accesos` (incluye `ok24h`, `errores24h`, `ultimoError` y `sinIdentificar7d`) · `POST /api/accesos` (devuelve el token) ·
+`PUT /api/accesos/:id` · `POST /api/accesos/:id/token` (regenera) · `DELETE /api/accesos/:id` (borra también su registro) ·
+`GET /api/accesos/:id/preview` · `GET /api/accesos/:id/registro?errores=1&limit=100` ·
+`GET /api/accesos/sin-identificar` (rechazos de los últimos 7 días sin acceso) ·
 `GET /api/accesos/vehiculos` (patentes que reconoce el backend).
 
 ---

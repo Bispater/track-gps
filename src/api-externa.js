@@ -11,6 +11,7 @@
 // Responde con lo que el recolector de fm-track ya tiene en RAM: no genera consultas a
 // fm-track. Fechas en hora de Chile con su offset (ISO 8601, ej. 2026-11-11T12:42:10-03:00).
 // El token se guarda como hash SHA-256 y se muestra una sola vez (al crearlo o regenerarlo).
+// Cada consulta, respondida o rechazada, queda en api_access_log (90 días) para verla en el panel.
 import crypto from 'node:crypto';
 import * as db from './db.js';
 import { ensurePositions, getLatestPositions } from './fmtrack.js';
@@ -24,6 +25,7 @@ const USUARIO_RE = /^[a-z0-9][a-z0-9._-]{2,39}$/;
 // ---------- accesos en memoria (se recargan de la base tras cada cambio) ----------
 let byHash = new Map(); // sha256(token) → fila de api_access
 let byId = new Map();   // id → fila
+let byUsuario = new Map(); // usuario → fila (para anotar intentos fallidos en su acceso)
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const newToken = () => 'psg_' + crypto.randomBytes(24).toString('base64url');
 
@@ -31,6 +33,16 @@ async function reload() {
   const rows = await db.listApiAccess();
   byHash = new Map(rows.map((r) => [r.token_hash, r]));
   byId = new Map(rows.map((r) => [String(r.id), r]));
+  byUsuario = new Map(rows.map((r) => [r.usuario, r]));
+}
+const LOG_RETENTION_DAYS = 90;
+async function pruneLog() {
+  try {
+    const n = await db.pruneApiAccessLog(LOG_RETENTION_DAYS);
+    if (n) console.log(`[api-externa] registro: purgadas ${n} consultas de más de ${LOG_RETENTION_DAYS} días`);
+  } catch (err) {
+    console.warn('[api-externa] no se pudo purgar el registro:', String(err));
+  }
 }
 export async function initApiAccess() {
   try {
@@ -39,6 +51,8 @@ export async function initApiAccess() {
   } catch (err) {
     console.warn('[api-externa] no se pudieron cargar los accesos:', String(err));
   }
+  setTimeout(pruneLog, 60_000).unref();
+  setInterval(pruneLog, 6 * 3600_000).unref();
 }
 
 // ---------- respuesta ----------
@@ -92,23 +106,26 @@ function buildBody(patentes, filtro = null) {
 function credentials(req) {
   const h = String(req.headers.authorization || '').trim();
   const m = h.match(/^(\S+)\s+(.+)$/);
-  if (m && /^bearer$/i.test(m[1])) return { token: m[2].trim() };
+  if (m && /^bearer$/i.test(m[1])) return { metodo: 'bearer', token: m[2].trim() };
   if (m && /^basic$/i.test(m[1])) {
     const dec = Buffer.from(m[2].trim(), 'base64').toString('utf8');
     const i = dec.indexOf(':');
-    if (i > 0) return { usuario: dec.slice(0, i).trim().toLowerCase(), token: dec.slice(i + 1) };
-    return null;
+    if (i > 0) return { metodo: 'basic', usuario: dec.slice(0, i).trim().toLowerCase(), token: dec.slice(i + 1) };
+    return { metodo: 'basic', token: '' };
   }
   const k = req.headers['x-api-key'];
-  return k ? { token: String(k).trim() } : null;
+  return k ? { metodo: 'api-key', token: String(k).trim() } : null;
 }
+// → { acc } si las credenciales son válidas; si no, { acc: null, resultado, owner }: owner es el
+// acceso del usuario enviado (Basic), para que el intento fallido se vea en ese acceso.
 function authenticate(req) {
-  const c = credentials(req);
-  if (!c?.token) return null;
-  const acc = byHash.get(hashToken(c.token));
-  if (!acc) return null;
-  if (c.usuario != null && c.usuario !== acc.usuario) return null;
-  return acc;
+  const cred = credentials(req);
+  if (!cred?.token) return { acc: null, cred, resultado: 'sin_credenciales', owner: null };
+  const acc = byHash.get(hashToken(cred.token));
+  if (acc && (cred.usuario == null || cred.usuario === acc.usuario)) return { acc, cred };
+  const owner = cred.usuario != null ? byUsuario.get(cred.usuario) || null : null;
+  const resultado = cred.usuario != null && !owner ? 'usuario_desconocido' : 'token_invalido';
+  return { acc: null, cred, resultado, owner };
 }
 // IP real del cliente (Caddy agrega X-Forwarded-For)
 const clientIp = (req) => String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || null;
@@ -124,19 +141,59 @@ function rateCheck(acc) {
   return 0;
 }
 
+// ---------- registro de consultas ----------
+// Tope de filas por minuto: por acceso, o por IP si no se identificó el acceso. Lo que pase
+// del tope se responde igual, solo no se anota (evita que un cliente en bucle llene la tabla).
+const LOG_MAX_PER_MIN = { acceso: 30, ip: 10 };
+let logMinute = 0;
+const logCounts = new Map();
+function logAllowed(key, max) {
+  const min = Math.floor(Date.now() / 60000);
+  if (min !== logMinute) { logMinute = min; logCounts.clear(); }
+  const n = (logCounts.get(key) || 0) + 1;
+  logCounts.set(key, n);
+  return n <= max;
+}
+function logRequest(req, t0, { acc = null, cred = null, status, resultado, body = null }) {
+  const ip = clientIp(req);
+  if (!logAllowed(acc ? `a:${acc.id}` : `ip:${ip}`, acc ? LOG_MAX_PER_MIN.acceso : LOG_MAX_PER_MIN.ip)) return;
+  const tok = String(cred?.token || '');
+  db.insertApiAccessLog({
+    accessId: acc?.id ?? null,
+    usuario: String(acc?.usuario ?? cred?.usuario ?? '').slice(0, 60) || null,
+    ip,
+    metodo: cred?.metodo ?? null,
+    status,
+    resultado,
+    vehiculos: body ? body.total : null,
+    conPosicion: body ? body.vehiculos.filter((v) => v.fecha_hora).length : null,
+    filtro: typeof req.query.patente === 'string' ? req.query.patente.slice(0, 200) : null,
+    // últimos 4 caracteres del token rechazado: permite ver si el cliente usa uno antiguo
+    tokenFin: status === 401 && tok.length >= 8 ? tok.slice(-4) : null,
+    userAgent: String(req.headers['user-agent'] || '').slice(0, 200) || null,
+    ms: Date.now() - t0,
+  }).catch((err) => console.warn('[api-externa] no se pudo anotar la consulta:', String(err)));
+}
+
 // Rutas públicas: se registran ANTES del login del panel (autentican con su propio token)
 export function registerExternalApi(app) {
   app.get(EXTERNAL_PATH, async (req, res) => {
+    const t0 = Date.now();
     res.setHeader('Cache-Control', 'no-store');
-    const acc = authenticate(req);
+    const { acc, cred, resultado, owner } = authenticate(req);
     if (!acc) {
+      logRequest(req, t0, { acc: owner, cred, status: 401, resultado });
       res.setHeader('WWW-Authenticate', 'Basic realm="PROASEG API", charset="UTF-8"');
       return res.status(401).json({ error: 'credenciales inválidas' });
     }
-    if (!acc.enabled) return res.status(403).json({ error: 'acceso desactivado' });
+    if (!acc.enabled) {
+      logRequest(req, t0, { acc, cred, status: 403, resultado: 'desactivado' });
+      return res.status(403).json({ error: 'acceso desactivado' });
+    }
     const wait = rateCheck(acc);
     if (wait) {
       db.recordApiAccessUse(acc.id, null, true).catch(() => {});
+      logRequest(req, t0, { acc, cred, status: 429, resultado: 'limite' });
       res.setHeader('Retry-After', String(wait));
       return res.status(429).json({ error: `máximo ${acc.limite_minuto} consulta(s) por minuto; reintentar en ${wait} s` });
     }
@@ -144,10 +201,13 @@ export function registerExternalApi(app) {
       await ensurePositions();
       const q = typeof req.query.patente === 'string' ? req.query.patente : null;
       const filtro = q ? new Set(q.split(',').map(plainPlate).filter(Boolean)) : null;
-      res.json(buildBody(acc.patentes, filtro));
+      const body = buildBody(acc.patentes, filtro);
+      res.json(body);
       db.recordApiAccessUse(acc.id, clientIp(req), false).catch(() => {});
+      logRequest(req, t0, { acc, cred, status: 200, resultado: 'ok', body });
     } catch (err) {
       res.status(500).json({ error: 'error interno' });
+      logRequest(req, t0, { acc, cred, status: 500, resultado: 'error' });
       console.warn('[api-externa] error:', String(err));
     }
   });
@@ -169,6 +229,21 @@ const publicAccess = (a) => ({
   lastIp: a.last_ip,
   consultas: Number(a.consultas || 0),
   limitadas: Number(a.limitadas || 0),
+});
+const publicLog = (r) => ({
+  id: String(r.id),
+  ts: r.ts?.toISOString?.() ?? null,
+  usuario: r.usuario,
+  ip: r.ip,
+  metodo: r.metodo,
+  status: r.status,
+  resultado: r.resultado,
+  vehiculos: r.vehiculos,
+  conPosicion: r.con_posicion,
+  filtro: r.filtro,
+  tokenFin: r.token_fin,
+  userAgent: r.user_agent,
+  ms: r.ms,
 });
 
 class InputError extends Error {}
@@ -216,7 +291,36 @@ const validId = (id) => /^\d{1,18}$/.test(String(id));
 export function registerApiAccessRoutes(app) {
   app.get('/api/accesos', async (_req, res) => {
     try {
-      res.json({ accesos: (await db.listApiAccess()).map(publicAccess), endpoint: EXTERNAL_PATH });
+      const [rows, s24, s7d] = await Promise.all([db.listApiAccess(), db.apiAccessLogSummary(24), db.apiAccessLogSummary(168)]);
+      const by24 = new Map(s24.map((r) => [String(r.access_id), r]));
+      res.json({
+        accesos: rows.map((r) => {
+          const s = by24.get(String(r.id));
+          return { ...publicAccess(r), ok24h: s?.ok ?? 0, errores24h: s?.errores ?? 0, ultimoError: s?.ultimo_error?.toISOString?.() ?? null };
+        }),
+        // intentos rechazados que no se pudieron asociar a ningún acceso (últimos 7 días)
+        sinIdentificar7d: s7d.find((r) => r.access_id == null)?.errores ?? 0,
+        endpoint: EXTERNAL_PATH,
+      });
+    } catch (err) { fail(res, err); }
+  });
+
+  // Registro de consultas de un acceso (?errores=1 → solo rechazadas)
+  app.get('/api/accesos/:id/registro', async (req, res) => {
+    if (!validId(req.params.id)) return res.status(404).json({ error: 'no existe' });
+    try {
+      const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+      const rows = await db.listApiAccessLog({ accessId: req.params.id, onlyErrors: req.query.errores === '1', limit });
+      res.json({ registro: rows.map(publicLog) });
+    } catch (err) { fail(res, err); }
+  });
+
+  // Intentos rechazados sin acceso identificado (token desconocido o sin credenciales), 7 días
+  app.get('/api/accesos/sin-identificar', async (req, res) => {
+    try {
+      const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+      const rows = await db.listApiAccessLog({ accessId: null, sinceHours: 168, limit });
+      res.json({ registro: rows.map(publicLog) });
     } catch (err) { fail(res, err); }
   });
 
